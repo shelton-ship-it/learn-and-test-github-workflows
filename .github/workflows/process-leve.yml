@@ -1,0 +1,1371 @@
+name: Process (Leve)
+
+# ═══════════════════════════════════════════════════════════════════════
+#
+# DIFERENÇAS EM RELAÇÃO AO process.yml:
+#
+#   1. STREAM COPY CONDICIONAL (vídeo)
+#      Reaproveita o PROBE_CODEC que já é extraído no step "Probe do
+#      vídeo" — não é uma nova etapa de detecção, é parar de descartar
+#      um dado que já existia. Se a fonte já é h264, usa `-c:v copy`
+#      (sem re-encode de vídeo); caso contrário, mantém o encode
+#      completo como hoje. Áudio continua sempre re-encodado pra AAC
+#      128k, porque é aí que a variação real da fonte está.
+#      TRADE-OFF CONHECIDO: com -c:v copy, -g/-keyint_min não têm
+#      efeito (só existem no encoder) — os segmentos HLS cortam nos
+#      keyframes que já existem na fonte, não em seg_duration exato.
+#      Alguns segmentos podem sair maiores que o alvo. Fallback: se o
+#      stream copy falhar (raro — container incompatível), cai para
+#      re-encode completo automaticamente.
+#
+#   2. EARLY_FAIL_TIMEOUT: 180s → 45s (coordinator e download torrent)
+#      Se um tracker/DHT vai responder, responde nos primeiros 15-30s.
+#      180s de espera morta num torrent sem seeders só queima minutos
+#      do plano sem necessidade.
+#
+#   3. Retries reduzidos onde a falha raramente é persistente:
+#      - dispatch_child (coordinator → episódios): 4 tentativas → 3,
+#        espera [10, 30, 60]s → [10, 25]s.
+#      - Webhook de notificação ao dispatcher: --retry 3 → 2,
+#        --retry-delay 5 → 3 (é só informativo, não crítico ao job).
+#
+#   RETRIES MANTIDOS SEM ALTERAÇÃO (propositalmente):
+#      - Registo no EdgeOne (5 tentativas) — ambiente serverless pode
+#        estar em sleep.
+#      - Git push do shard (8 tentativas) — única operação onde falha
+#        transitória de rede é comum e cara de recomeçar do zero.
+#      - get_repo_size_kb (4 tentativas) — lida com rate-limit
+#        secundário real da API do GitHub.
+# ═══════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Job ID'
+        required: true
+      video_url:
+        description: 'URL do vídeo — HTTP(S), magnet:, .torrent'
+        required: false
+        default: ''
+      seg_duration:
+        description: 'Duração segmento HLS (segundos)'
+        required: false
+        default: '4'
+      max_encode_height:
+        description: 'Altura máxima encode'
+        required: false
+        default: '720'
+      metadata:
+        description: 'JSON: { contentId, title, description, type, year, lang }'
+        required: false
+        default: '{}'
+      thumbnail_url:
+        description: 'URL da thumbnail (JPG/PNG)'
+        required: false
+        default: ''
+      season_number:
+        description: 'Número da temporada'
+        required: false
+        default: '0'
+      episode_number:
+        description: 'Número do episódio'
+        required: false
+        default: '0'
+      episode_title:
+        description: 'Título do episódio'
+        required: false
+        default: ''
+      file_indices:
+        description: 'Índices dos ficheiros no torrent'
+        required: false
+        default: ''
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    env:
+      WORK_DIR:       /tmp/sv_work/${{ inputs.job_id }}
+      CHACHA_KEY:     ${{ secrets.CHACHA_KEY }}
+      PIPELINE_API:   ${{ secrets.PIPELINE_API }}
+      ADMIN_API_KEY:  ${{ secrets.ADMIN_API_KEY }}
+      DISPATCHER_URL: ${{ secrets.DISPATCHER_URL }}
+
+    steps:
+      # ── 0. Preparar ambiente ─────────────────────────────────────────────
+      - name: Preparar ambiente
+        run: |
+          echo "JOB_ID=${{ inputs.job_id }}"             >> $GITHUB_ENV
+          echo "SEG_DURATION=${{ inputs.seg_duration }}" >> $GITHUB_ENV
+          echo "MAX_H=${{ inputs.max_encode_height }}"   >> $GITHUB_ENV
+          mkdir -p "/tmp/sv_work/${{ inputs.job_id }}/incoming" \
+                   "/tmp/sv_work/${{ inputs.job_id }}/hls" \
+                   "/tmp/sv_work/${{ inputs.job_id }}/thumbs"
+
+      - name: Instalar FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+
+      - name: Instalar dependências Python + libtorrent
+        run: |
+          pip install --quiet --upgrade cryptography
+          sudo apt-get install -y --no-install-recommends python3-libtorrent
+          python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # ARMAZENAMENTO CRUZADO — resolver credenciais da própria conta e da
+      # conta OPOSTA, uma única vez, logo no início
+      # ═══════════════════════════════════════════════════════════════════
+      # Antes: STORAGE_GITHUB_TOKEN/OWNER apontava sempre pra própria conta
+      # que executava o job — cada conta armazenava só os seus próprios
+      # bins. Agora, cada repo (das duas contas) tem os 4 secrets abaixo
+      # configurados com AS MESMAS credenciais nos dois lados (conta A e
+      # conta B) — o step usa github.repository_owner pra saber "quem sou
+      # eu" e resolve dois conjuntos:
+      #   SELF_TOKEN/SELF_OWNER     → própria conta (usado só pelo
+      #                                coordinator, pra disparar episódios
+      #                                filhos no PRÓPRIO repo — isso nunca
+      #                                muda, é sempre self-dispatch)
+      #   STORAGE_TARGET_TOKEN/OWNER → conta OPOSTA (usado nos steps de
+      #                                shard/push — é onde os bins passam
+      #                                a ser armazenados)
+      # O token nunca é escrito em texto claro nos logs (::add-mask::
+      # aplicado antes de gravar no GITHUB_ENV).
+      #
+      # REQUISITO DE DEPLOY: configurar em AMBOS os repos (conta A e conta
+      # B) os mesmos 4 secrets:
+      #   STORAGE_ACCOUNT_A_OWNER / STORAGE_ACCOUNT_A_TOKEN
+      #   STORAGE_ACCOUNT_B_OWNER / STORAGE_ACCOUNT_B_TOKEN
+      # Cada token precisa de permissão de escrita nos repos de shard da
+      # respectiva conta E de actions:write no repo de process-leve.yml
+      # dessa mesma conta (necessário pro self-dispatch do coordinator).
+      # Se migrado pra GitHub App, use aqui o token de instalação da App
+      # na conta correspondente.
+
+      - name: Resolver credenciais de armazenamento (própria conta + conta cruzada)
+        env:
+          ACCOUNT_A_OWNER: ${{ secrets.STORAGE_ACCOUNT_A_OWNER }}
+          ACCOUNT_A_TOKEN: ${{ secrets.STORAGE_ACCOUNT_A_TOKEN }}
+          ACCOUNT_B_OWNER: ${{ secrets.STORAGE_ACCOUNT_B_OWNER }}
+          ACCOUNT_B_TOKEN: ${{ secrets.STORAGE_ACCOUNT_B_TOKEN }}
+        run: |
+          SELF_OWNER="${{ github.repository_owner }}"
+
+          if [ "$SELF_OWNER" = "$ACCOUNT_A_OWNER" ]; then
+            SELF_TOKEN="$ACCOUNT_A_TOKEN"
+            TARGET_OWNER="$ACCOUNT_B_OWNER"
+            TARGET_TOKEN="$ACCOUNT_B_TOKEN"
+          elif [ "$SELF_OWNER" = "$ACCOUNT_B_OWNER" ]; then
+            SELF_TOKEN="$ACCOUNT_B_TOKEN"
+            TARGET_OWNER="$ACCOUNT_A_OWNER"
+            TARGET_TOKEN="$ACCOUNT_A_TOKEN"
+          else
+            echo "ERRO: github.repository_owner ($SELF_OWNER) não corresponde a STORAGE_ACCOUNT_A_OWNER nem STORAGE_ACCOUNT_B_OWNER — secrets desalinhados entre os dois repos."
+            exit 1
+          fi
+
+          if [ -z "$TARGET_OWNER" ] || [ -z "$TARGET_TOKEN" ] || [ -z "$SELF_TOKEN" ]; then
+            echo "ERRO: credenciais resolvidas mas algum valor ficou vazio — confira os secrets STORAGE_ACCOUNT_*_OWNER/TOKEN nos dois repos."
+            exit 1
+          fi
+
+          echo "::add-mask::$TARGET_TOKEN"
+          echo "::add-mask::$SELF_TOKEN"
+          echo "SELF_TOKEN=$SELF_TOKEN"               >> "$GITHUB_ENV"
+          echo "STORAGE_TARGET_OWNER=$TARGET_OWNER"   >> "$GITHUB_ENV"
+          echo "STORAGE_TARGET_TOKEN=$TARGET_TOKEN"   >> "$GITHUB_ENV"
+          echo "✓ A executar na conta: $SELF_OWNER → bins serão armazenados na conta: $TARGET_OWNER"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # COORDINATOR (séries/anime/dorama)
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: '[Coordinator] Detectar episódios e disparar jobs filhos'
+        if: |
+          inputs.video_url != '' &&
+          inputs.file_indices == '' &&
+          (
+            contains(fromJson(inputs.metadata).type, 'series') ||
+            contains(fromJson(inputs.metadata).type, 'anime')  ||
+            contains(fromJson(inputs.metadata).type, 'dorama')
+          ) &&
+          (
+            startsWith(inputs.video_url, 'magnet:') ||
+            endsWith(inputs.video_url, '.torrent')  ||
+            contains(inputs.video_url, 'infohash:')
+          )
+        env:
+          INPUT_METADATA:    ${{ inputs.metadata }}
+          INPUT_VIDEO_URL:   ${{ inputs.video_url }}
+          INPUT_THUMBNAIL:   ${{ inputs.thumbnail_url }}
+          INPUT_SEG:         ${{ inputs.seg_duration }}
+          INPUT_HEIGHT:      ${{ inputs.max_encode_height }}
+          INPUT_SEASON:      ${{ inputs.season_number }}
+          STORAGE_TOKEN:     ${{ env.SELF_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 << 'PYEOF'
+          import libtorrent as lt
+          import os, sys, re, json, time, subprocess, urllib.request, urllib.error
+
+          url          = os.environ['INPUT_VIDEO_URL']
+          metadata_raw = os.environ['INPUT_METADATA']
+          season_num   = int(os.environ.get('INPUT_SEASON', '0') or '0')
+          VIDEO_EXTS   = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
+          BATCH_LIMIT  = 1_400 * 1024 * 1024
+
+          try:    metadata = json.loads(metadata_raw)
+          except: metadata = {}
+          content_id = metadata.get('contentId') or ''
+
+          print(f"Coordinator: {metadata.get('title','?')} S{season_num:02d} | {url[:70]}...")
+
+          ses = lt.session({
+            'listen_interfaces':       '0.0.0.0:6882',
+            'enable_dht':              True,
+            'enable_lsd':              True,
+            'use_dht_as_fallback':     True,
+            'dht_restrict_routing_ips': False,
+            'dht_bootstrap_nodes':     'router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881,dht.aelitis.com:6881',
+            'alert_mask':              0xffffffff,
+          })
+          try: ses.apply_settings({'connections_limit':200,'active_downloads':1,'active_seeds':0})
+          except Exception as e: print(f"  apply_settings parcial: {e}")
+
+          def log_alerts(ses):
+            """Lê e imprime alertas de tracker pendentes. Devolve True se
+            algum tracker respondeu com sucesso (mesmo que com 0 peers)."""
+            tracker_replied = False
+            for a in ses.pop_alerts():
+              name = type(a).__name__
+              try:
+                msg = a.message()
+              except Exception:
+                msg = str(a)
+              if 'tracker_error' in name:
+                print(f"  ✗ {name}: {msg}")
+              elif 'tracker_reply' in name:
+                tracker_replied = True
+                print(f"  ✓ {name}: {msg}")
+              elif 'tracker_warning' in name:
+                print(f"  ⚠ {name}: {msg}")
+            return tracker_replied
+
+          os.makedirs('/tmp/coord_meta', exist_ok=True)
+
+          if url.startswith('magnet:') or 'infohash:' in url:
+            params = lt.parse_magnet_uri(url)
+            params.save_path = '/tmp/coord_meta'
+          else:
+            torrent_path = '/tmp/coord.torrent'
+            urllib.request.urlretrieve(url, torrent_path)
+            ti = lt.torrent_info(torrent_path)
+            params = lt.add_torrent_params()
+            params.ti = ti
+            params.save_path = '/tmp/coord_meta'
+
+          params.flags = lt.torrent_flags.upload_mode | lt.torrent_flags.paused
+          handle = ses.add_torrent(params)
+          handle.resume()
+
+          print("  Aguardando metadados...")
+          t0 = time.time()
+          tracker_replied = False
+          # LEVE: 180s → 45s — se um tracker/DHT vai responder, responde
+          # nos primeiros 15-30s. 45s ainda dá bootstrap suficiente sem
+          # queimar minutos de plano em torrents mortos.
+          EARLY_FAIL_TIMEOUT = 45
+
+          METADATA_TIMEOUT = 900
+          while not handle.status().has_metadata:
+            if log_alerts(ses):
+              tracker_replied = True
+            elapsed = int(time.time() - t0)
+            st = handle.status()
+            dht_nodes = ses.status().dht_nodes if hasattr(ses.status(), 'dht_nodes') else 0
+            if (elapsed > EARLY_FAIL_TIMEOUT and st.num_peers == 0
+                and not tracker_replied and dht_nodes == 0):
+              print(f"ERRO: {EARLY_FAIL_TIMEOUT}s sem peers, sem resposta de tracker e sem nós DHT — torrent sem seeders/trackers vivos. A abortar cedo (não esperar até {METADATA_TIMEOUT}s).")
+              ses.remove_torrent(handle)
+              sys.exit(1)
+            if elapsed > METADATA_TIMEOUT:
+              print(f"ERRO: timeout metadados ({METADATA_TIMEOUT}s)")
+              ses.remove_torrent(handle)
+              sys.exit(1)
+            ses.wait_for_alert(1000)
+            if elapsed % 15 == 0 and elapsed > 0:
+              print(f"  ... {elapsed}s | peers: {st.num_peers} | dht_nodes: {dht_nodes} | tracker_ok: {tracker_replied}")
+
+          info = handle.get_torrent_info()
+          fs   = info.files()
+          print(f"  Metadados OK: {info.name()} | {fs.num_files()} ficheiros | {info.total_size()//(1024*1024)} MB")
+          ses.remove_torrent(handle)
+
+          video_files = []
+          for i in range(fs.num_files()):
+            path = fs.file_path(i)
+            size = fs.file_size(i)
+            ext  = os.path.splitext(path)[1].lower()
+            if ext in VIDEO_EXTS:
+              video_files.append({'index': i, 'path': path, 'size': size, 'name': os.path.basename(path)})
+
+          if not video_files:
+            print("ERRO: nenhum ficheiro de vídeo nos metadados")
+            sys.exit(1)
+
+          print(f"  Vídeos encontrados: {len(video_files)}")
+
+          def extract_ep(name):
+            base = os.path.splitext(name)[0]
+            patterns = [
+              r'[Ss]\d+[Ee](\d+)',
+              r'[Ee][Pp]?[\s._-]?(\d{1,3})',
+              r'[\s._-](\d{2,3})[\s._-]',
+              r'^(\d{1,3})[\s._-]',
+              r'[\s._-](\d{1,3})\.',
+            ]
+            for pat in patterns:
+              m = re.search(pat, base, re.IGNORECASE)
+              if m: return int(m.group(1))
+            return None
+
+          for vf in video_files:
+            vf['ep_num'] = extract_ep(vf['name'])
+
+          video_files.sort(key=lambda x: (x['ep_num'] is None, x['ep_num'] or 0, x['name']))
+
+          used_nums = {v['ep_num'] for v in video_files if v['ep_num'] is not None}
+          counter   = 1
+          for vf in video_files:
+            if vf['ep_num'] is None:
+              while counter in used_nums:
+                counter += 1
+              vf['ep_num'] = counter
+              used_nums.add(counter)
+              counter += 1
+
+          for vf in video_files:
+            print(f"  [{vf['index']:2d}] ep{vf['ep_num']:02d} | {vf['name']} | {vf['size']//(1024*1024)}MB")
+
+          def est(size):
+            return int(size * 0.55 * 1.17)
+
+          batches, cur, cur_size = [], [], 0
+          for vf in video_files:
+            e = est(vf['size'])
+            if cur and cur_size + e > BATCH_LIMIT:
+              batches.append(cur)
+              cur, cur_size = [vf], e
+            else:
+              cur.append(vf)
+              cur_size += e
+          if cur: batches.append(cur)
+
+          print(f"  Batches: {len(batches)}")
+          for i, b in enumerate(batches):
+            print(f"    Batch {i+1}: eps {[v['ep_num'] for v in b]} | ~{sum(v['size'] for v in b)//(1024*1024)}MB raw")
+
+          safe_cid = re.sub(r'[^a-z0-9-]', '', (content_id or metadata.get('title','serie'))[:20].replace(' ','-').lower())
+
+          children = []
+          for bi, batch in enumerate(batches):
+            indices_str = ','.join(str(v['index']) for v in batch)
+            ep_numbers  = ','.join(str(v['ep_num']) for v in batch)
+            first_ep    = batch[0]['ep_num']
+            child_id    = f"{safe_cid}-s{season_num:02d}-ep{first_ep:02d}-b{bi+1}"
+            child_meta  = {**metadata, 'contentId': content_id or safe_cid}
+
+            children.append({
+              'job_id':            child_id,
+              'video_url':         url,
+              'thumbnail_url':     os.environ.get('INPUT_THUMBNAIL',''),
+              'seg_duration':      os.environ.get('INPUT_SEG','4'),
+              'max_encode_height': os.environ.get('INPUT_HEIGHT','720'),
+              'metadata':          json.dumps(child_meta),
+              'season_number':     str(season_num),
+              'episode_number':    ep_numbers,
+              'episode_title':     '',
+              'file_indices':      indices_str,
+            })
+
+          if not children:
+            print("ERRO: nenhum filho preparado")
+            sys.exit(1)
+
+          storage_token = os.environ.get('STORAGE_TOKEN', '')
+          github_repo   = os.environ.get('GITHUB_REPOSITORY', '')
+
+          if not storage_token or not github_repo:
+            print("ERRO: STORAGE_TOKEN ou GITHUB_REPOSITORY indisponíveis")
+            sys.exit(1)
+
+          # DISPATCH PARALELO — cada episódio escreve na sua própria branch
+          # exclusiva (job-<job_id>), sem necessidade de encadeamento FIFO.
+          # LEVE: 4 tentativas → 3, espera [10,30,60]s → [10,25]s — a API
+          # do GitHub raramente fica indisponível por tempo suficiente pra
+          # justificar uma 4ª tentativa com espera de 60s.
+          def dispatch_child(child, index, total):
+            for attempt in range(1, 4):
+              r = subprocess.run([
+                'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
+                '-H', f'Authorization: Bearer {storage_token}',
+                '-H', 'Accept: application/vnd.github+json',
+                '-H', 'X-GitHub-Api-Version: 2022-11-28',
+                f'https://api.github.com/repos/{github_repo}/actions/workflows/process-leve.yml/dispatches',
+                '-d', json.dumps({'ref': 'main', 'inputs': child}),
+              ], capture_output=True, text=True)
+              code = r.stdout.strip()
+              if code == '204':
+                print(f"  ✓ Episódio {index}/{total} disparado: {child['job_id']}")
+                return True
+              elif code.startswith('5') or code == '':
+                wait = [10, 25][attempt-1] if attempt <= 2 else 25
+                print(f"  ⚠ Episódio {index}/{total} tentativa {attempt}/3 — HTTP {code or 'sem resposta'} — aguarda {wait}s...")
+                time.sleep(wait)
+              else:
+                print(f"  ✗ Episódio {index}/{total} erro HTTP {code} (não retry)")
+                return False
+            print(f"  ✗ Episódio {index}/{total} falhou após 3 tentativas")
+            return False
+
+          ok_count = 0
+          for i, child in enumerate(children, start=1):
+            if dispatch_child(child, i, len(children)):
+              ok_count += 1
+            # Espaçamento entre chamadas — evita rajada de POSTs no mesmo
+            # instante (secondary rate-limit + padrão de disparo em massa
+            # correlacionado no tempo).
+            if i < len(children):
+              time.sleep(1.5)
+
+          fail_count = len(children) - ok_count
+          print(f"\n✅ Coordinator: {ok_count}/{len(children)} episódio(s) disparados em paralelo" + (f" | ✗ {fail_count} falha(s)" if fail_count else ""))
+          if ok_count == 0:
+            sys.exit(1)
+          sys.exit(0)
+          PYEOF
+
+      # ═══════════════════════════════════════════════════════════════════
+      # DOWNLOAD / ENCODE / ENCRIPTAÇÃO
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: '[Modo A] Descarregar vídeo'
+        if: inputs.video_url != ''
+        run: |
+          URL="${{ inputs.video_url }}"
+          if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]] || [[ "$URL" == *infohash:* ]]; then
+            echo "→ Modo torrent (libtorrent Python)"
+            python3 << 'PYEOF'
+          import libtorrent as lt
+          import os, sys, time, pathlib
+
+          url      = os.environ['video_url_env']
+          dest_dir = os.environ['WORK_DIR'] + '/incoming'
+          MAX_WAIT = 3600
+
+          ses = lt.session({
+            'listen_interfaces':       '0.0.0.0:6881',
+            'enable_dht':              True,
+            'enable_lsd':              True,
+            'use_dht_as_fallback':     True,
+            'dht_restrict_routing_ips': False,
+            'dht_bootstrap_nodes':     'router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881,dht.aelitis.com:6881',
+            'alert_mask':              0xffffffff,
+          })
+          try: ses.apply_settings({'connections_limit':200,'active_downloads':1,'active_seeds':0})
+          except Exception as e: print(f"⚠ apply_settings parcial: {e}")
+
+          def log_alerts(ses):
+            """Lê e imprime alertas de tracker/DHT pendentes. Devolve True se
+            algum tracker respondeu com sucesso (mesmo que com 0 peers)."""
+            tracker_replied = False
+            for a in ses.pop_alerts():
+              name = type(a).__name__
+              try:
+                msg = a.message()
+              except Exception:
+                msg = str(a)
+              if 'tracker_error' in name:
+                print(f"  ✗ {name}: {msg}")
+              elif 'tracker_reply' in name:
+                tracker_replied = True
+                print(f"  ✓ {name}: {msg}")
+              elif 'tracker_warning' in name:
+                print(f"  ⚠ {name}: {msg}")
+              elif 'tracker_announce' in name:
+                print(f"  → {name}: {msg}")
+            return tracker_replied
+
+          params = lt.add_torrent_params()
+          params.save_path = dest_dir
+
+          if url.startswith('magnet:') or 'infohash:' in url:
+            params = lt.parse_magnet_uri(url)
+            params.save_path = dest_dir
+            print(f"  Adicionando magnet: {url[:80]}...")
+          else:
+            import urllib.request
+            torrent_path = '/tmp/input.torrent'
+            print(f"  Descarregando .torrent de: {url}")
+            urllib.request.urlretrieve(url, torrent_path)
+            info = lt.torrent_info(torrent_path)
+            params.ti = info
+            print(f"  Torrent: {info.name()} ({info.total_size() // (1024*1024)} MB)")
+
+          handle = ses.add_torrent(params)
+
+          file_indices_raw = os.environ.get('FILE_INDICES_ENV', '').strip()
+          if file_indices_raw:
+            print(f"  Modo worker — aguardando metadados para definir prioridades...")
+            t0_meta = time.time()
+            while not handle.status().has_metadata:
+              if time.time() - t0_meta > 60:
+                print("  ⚠ Timeout metadados — continuando sem prioridades")
+                break
+              ses.wait_for_alert(500)
+            if handle.status().has_metadata:
+              info_w    = handle.get_torrent_info()
+              num_files = info_w.files().num_files()
+              wanted    = set(int(x) for x in file_indices_raw.split(',') if x.strip().isdigit())
+              for fi in range(num_files):
+                prio = 7 if fi in wanted else 0
+                handle.file_priority(fi, prio)
+              print(f"  Prioridades definidas: {sorted(wanted)} activos | {num_files - len(wanted)} ignorados")
+            else:
+              print("  ⚠ Sem metadados — descarregando tudo (fallback)")
+
+          print(f"  Destino: {dest_dir}")
+          last_pct       = -1
+          last_log_t     = 0
+          start_t        = time.time()
+          stall_t        = time.time()
+          stall_bytes    = 0
+          tracker_replied = False
+          # LEVE: 180s → 45s (mesmo raciocínio do coordinator)
+          EARLY_FAIL_TIMEOUT = 45
+
+          while True:
+            s   = handle.status()
+            if log_alerts(ses):
+              tracker_replied = True
+            pct     = int(s.progress * 100)
+            elapsed = int(time.time() - start_t)
+            if pct != last_pct or elapsed - last_log_t >= 30:
+              dl_kb     = s.download_rate // 1024
+              peers     = s.num_peers
+              dht_nodes = ses.status().dht_nodes if hasattr(ses.status(), 'dht_nodes') else '?'
+              print(f"  [{elapsed:4d}s] {pct:3d}% | {dl_kb:6d} KB/s | peers: {peers} | dht_nodes: {dht_nodes} | tracker_ok: {tracker_replied}")
+              last_pct   = pct
+              last_log_t = elapsed
+            current_bytes = int(s.progress * (s.total_wanted or 1))
+            if current_bytes > stall_bytes:
+              stall_bytes = current_bytes
+              stall_t     = time.time()
+            elif s.num_peers > 0 and (time.time() - stall_t) > 300:
+              print('⚠ Sem progresso por 5 min — continuando...')
+              stall_t = time.time()
+            if s.is_seeding or s.progress >= 1.0:
+              print(f"✓ Download completo ({int(time.time()-start_t)}s)")
+              break
+            if (elapsed > EARLY_FAIL_TIMEOUT and s.num_peers == 0
+                and not tracker_replied
+                and (not hasattr(ses.status(), 'dht_nodes') or ses.status().dht_nodes == 0)):
+              print(f"✗ {EARLY_FAIL_TIMEOUT}s sem peers, sem resposta de tracker e sem nós DHT — torrent sem seeders/trackers vivos. A abortar cedo (não esperar até {MAX_WAIT}s).")
+              sys.exit(1)
+            if (time.time() - start_t) > MAX_WAIT:
+              print(f'⚠ Timeout após {MAX_WAIT}s — progresso: {pct}%')
+              if pct == 0: sys.exit(1)
+              if pct < 50: sys.exit(1)
+              print('  Download parcial (>50%) — continuando...')
+              break
+            ses.wait_for_alert(1000)
+
+          ses.remove_torrent(handle, 0)
+          files      = list(pathlib.Path(dest_dir).rglob('*'))
+          video_exts = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
+          videos     = [f for f in files if f.suffix.lower() in video_exts]
+          print(f"  Ficheiros descarregados: {len(files)}")
+          for v in videos: print(f"  → Vídeo: {v} ({v.stat().st_size // (1024*1024)} MB)")
+          if not videos:
+            print('⚠ Nenhum vídeo encontrado no torrent')
+            for f in files: print(f'  {f} ({f.stat().st_size} bytes)')
+          PYEOF
+          else
+            echo "→ Modo URL directa (curl)"
+            curl -L --retry 3 --retry-delay 5 --progress-bar --fail \
+              -o "$WORK_DIR/incoming/input.video" \
+              "$URL"
+            SIZE=$(stat -c%s "$WORK_DIR/incoming/input.video" 2>/dev/null || echo 0)
+            echo "✓ Download: $(du -sh $WORK_DIR/incoming/input.video | cut -f1) ($SIZE bytes)"
+            if [ "$SIZE" -lt 10000 ]; then
+              echo "⚠ Ficheiro demasiado pequeno — download falhou"
+              cat "$WORK_DIR/incoming/input.video" || true
+              exit 1
+            fi
+          fi
+        env:
+          video_url_env:    ${{ inputs.video_url }}
+          FILE_INDICES_ENV: ${{ inputs.file_indices }}
+
+      - name: '[Modo B] Obter vídeo via Artifact'
+        if: inputs.video_url == ''
+        uses: actions/download-artifact@v4
+        with:
+          name: video-${{ inputs.job_id }}
+          path: ${{ env.WORK_DIR }}/incoming/
+
+      - name: Detectar ficheiro de vídeo (+ extrair .rar/.zip se necessário)
+        run: |
+          VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg video"
+          FILE_INDICES="${{ inputs.file_indices }}"
+          if [ -n "$FILE_INDICES" ]; then
+            echo "→ Modo worker | file_indices: $FILE_INDICES"
+          fi
+
+          find_video() {
+            for ext in $VIDEO_EXTS; do
+              FOUND=$(find "$WORK_DIR/incoming/" -iname "*.${ext}" | head -1)
+              if [ -n "$FOUND" ]; then echo "$FOUND"; return; fi
+            done
+          }
+
+          VIDEO_PATH=$(find_video)
+
+          if [ -z "$VIDEO_PATH" ]; then
+            echo "Nenhum vídeo directo — procurando arquivos comprimidos..."
+            RAR_FILES=$(find "$WORK_DIR/incoming/" -iname "*.rar" | head -1)
+            ZIP_FILES=$(find "$WORK_DIR/incoming/" -iname "*.zip" | head -1)
+            TAR_FILES=$(find "$WORK_DIR/incoming/" -iname "*.tar*" | head -1)
+
+            if [ -n "$RAR_FILES" ]; then
+              echo "→ Encontrado .rar: $RAR_FILES"
+              sudo apt-get install -y --no-install-recommends unrar-free 2>/dev/null || \
+              sudo apt-get install -y --no-install-recommends unrar 2>/dev/null || true
+              EXTRACT_DIR="$WORK_DIR/incoming/extracted"
+              mkdir -p "$EXTRACT_DIR"
+              if command -v unrar &>/dev/null; then
+                unrar x -o+ "$RAR_FILES" "$EXTRACT_DIR/" && echo "✓ unrar concluído"
+              elif command -v unrar-free &>/dev/null; then
+                unrar-free -x "$RAR_FILES" "$EXTRACT_DIR/" && echo "✓ unrar-free concluído"
+              else
+                echo "  unrar não disponível — tentando bsdtar"
+                bsdtar -x -f "$RAR_FILES" -C "$EXTRACT_DIR/" && echo "✓ bsdtar concluído"
+              fi
+              VIDEO_PATH=$(find_video)
+            elif [ -n "$ZIP_FILES" ]; then
+              echo "→ Encontrado .zip: $ZIP_FILES"
+              EXTRACT_DIR="$WORK_DIR/incoming/extracted"
+              mkdir -p "$EXTRACT_DIR"
+              unzip -o "$ZIP_FILES" -d "$EXTRACT_DIR/"
+              VIDEO_PATH=$(find_video)
+            elif [ -n "$TAR_FILES" ]; then
+              echo "→ Encontrado .tar: $TAR_FILES"
+              EXTRACT_DIR="$WORK_DIR/incoming/extracted"
+              mkdir -p "$EXTRACT_DIR"
+              tar -xf "$TAR_FILES" -C "$EXTRACT_DIR/"
+              VIDEO_PATH=$(find_video)
+            fi
+          fi
+
+          if [ -z "$VIDEO_PATH" ]; then
+            echo "ERRO: nenhum vídeo encontrado após extracção"
+            find "$WORK_DIR/incoming/" -type f | head -20
+            exit 1
+          fi
+
+          echo "VIDEO_PATH=$VIDEO_PATH" >> $GITHUB_ENV
+          echo "✓ Vídeo: $VIDEO_PATH ($(du -sh "$VIDEO_PATH" | cut -f1))"
+
+      - name: Probe do vídeo
+        run: |
+          ffprobe -v quiet -print_format json -show_streams -show_format "$VIDEO_PATH" > "$WORK_DIR/probe.json"
+          python3 << 'PYEOF'
+          import json, os
+          d   = json.load(open(os.environ['WORK_DIR'] + '/probe.json'))
+          vs  = next((s for s in d['streams'] if s['codec_type'] == 'video'), {})
+          fmt = d['format']
+          num, den = map(int, vs.get('r_frame_rate','24/1').split('/'))
+          fps       = num / den if den else num
+          src_codec = vs.get('codec_name', 'unknown')
+          probe = {
+            'duration': float(fmt.get('duration', 0)),
+            'width':    vs.get('width',  1920),
+            'height':   vs.get('height', 1080),
+            'codec':    src_codec,
+            'fps':      fps,
+            'bitrate':  int(fmt.get('bit_rate', 0)),
+          }
+          json.dump(probe, open(os.environ['WORK_DIR'] + '/probe_parsed.json','w'))
+          max_h      = int(os.environ['MAX_H'])
+          eff_h      = min(probe['height'], max_h)
+          will_scale = probe['height'] > max_h
+          eff_w      = round((probe['width'] / probe['height']) * eff_h / 2) * 2 if will_scale else probe['width']
+          h          = eff_h
+          label = ('4k' if h>=2160 else '1440p' if h>=1440 else '1080p' if h>=1080 else '720p' if h>=720 else f'{h}p')
+          # LEVE: STREAM_COPY=true só quando codec fonte já é h264 E não
+          # é preciso reescalar (will_scale=false) — stream copy não
+          # consegue mudar resolução, só remuxar o mesmo stream.
+          stream_copy = (src_codec == 'h264') and (not will_scale)
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f"PROBE_DURATION={probe['duration']}\n")
+            f.write(f"PROBE_WIDTH={probe['width']}\n")
+            f.write(f"PROBE_HEIGHT={probe['height']}\n")
+            f.write(f"PROBE_CODEC={probe['codec']}\n")
+            f.write(f"PROBE_FPS={fps}\n")
+            f.write(f"PROBE_BITRATE={probe['bitrate']}\n")
+            f.write(f"EFF_HEIGHT={eff_h}\n")
+            f.write(f"EFF_WIDTH={eff_w}\n")
+            f.write(f"WILL_SCALE={'true' if will_scale else 'false'}\n")
+            f.write(f"QUALITY_LABEL={label}\n")
+            f.write(f"STREAM_COPY={'true' if stream_copy else 'false'}\n")
+          print(f"✓ {probe['width']}x{probe['height']} | codec: {src_codec} | {fps:.2f}fps | {probe['duration']:.1f}s")
+          print(f"  → encode {eff_w}x{eff_h} ({label}) | rescale: {will_scale} | stream_copy: {stream_copy}")
+          PYEOF
+
+      - name: HLS encode (stream copy se h264 nativo, senão libx264 superfast CRF26 + AAC 128k)
+        run: |
+          HLS_DIR="$WORK_DIR/hls"
+          GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
+
+          # LEVE: reaproveita o PROBE_CODEC já extraído no step "Probe do
+          # vídeo" — se a fonte já é h264 (e não precisa de reescala),
+          # remuxa sem re-encode de vídeo (-c:v copy). Corta o custo de
+          # CPU/tempo do encode de vídeo nesse caso, mantendo só o
+          # re-encode de áudio pra AAC 128k (que é onde a fonte realmente
+          # varia). Fallback automático pra encode completo se o stream
+          # copy falhar.
+          if [ "$STREAM_COPY" = "true" ]; then
+            echo "  → STREAM_COPY ativo (fonte já é h264, sem reescala) — sem re-encode de vídeo"
+            VCODEC_ARGS="-c:v copy"
+          else
+            echo "  → Re-encode de vídeo necessário (codec=${PROBE_CODEC} ou reescala=${WILL_SCALE})"
+            if [ "$WILL_SCALE" = "true" ]; then
+              SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}"
+            else
+              SCALE_ARGS=""
+            fi
+            VCODEC_ARGS="$SCALE_ARGS -c:v libx264 -preset superfast -crf 26 -tune fastdecode -profile:v high -level 4.0 -pix_fmt yuv420p -g $GOP -keyint_min ${SEG_DURATION}"
+          fi
+
+          echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s) — GOP só se aplica no modo re-encode"
+
+          run_encode() {
+            ffmpeg -hide_banner -loglevel warning -stats \
+              -i "$VIDEO_PATH" \
+              $VCODEC_ARGS \
+              -c:a aac -b:a 128k -ac 2 \
+              -f hls \
+              -hls_time ${SEG_DURATION} \
+              -hls_playlist_type vod \
+              -hls_segment_type fmp4 \
+              -hls_fmp4_init_filename "init.mp4" \
+              -hls_flags independent_segments \
+              -hls_segment_filename "$HLS_DIR/seg%05d.m4s" \
+              -y "$HLS_DIR/index.m3u8"
+          }
+
+          if ! run_encode; then
+            if [ "$STREAM_COPY" = "true" ]; then
+              echo "  ⚠ Stream copy falhou (container incompatível) — fallback pra re-encode completo"
+              rm -f "$HLS_DIR"/*.m4s "$HLS_DIR/init.mp4" "$HLS_DIR/index.m3u8" 2>/dev/null || true
+              if [ "$WILL_SCALE" = "true" ]; then
+                SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}"
+              else
+                SCALE_ARGS=""
+              fi
+              VCODEC_ARGS="$SCALE_ARGS -c:v libx264 -preset superfast -crf 26 -tune fastdecode -profile:v high -level 4.0 -pix_fmt yuv420p -g $GOP -keyint_min ${SEG_DURATION}"
+              run_encode
+            else
+              echo "✗ Encode falhou (modo re-encode, sem fallback disponível)"
+              exit 1
+            fi
+          fi
+
+          echo "✓ $(ls $HLS_DIR/*.m4s | wc -l) segmentos .m4s gerados"
+          echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
+
+      - name: Obter thumbnails
+        env:
+          INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
+        run: |
+          python3 << 'PYEOF'
+          import subprocess, os, json
+          thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
+          duration  = float(os.environ['PROBE_DURATION'])
+          video     = os.environ['VIDEO_PATH']
+          thumb_url = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
+          thumbs    = []
+
+          def detect_image_ext(path):
+            with open(path, 'rb') as f:
+              h = f.read(16)
+            if h[:3] == b'\xff\xd8\xff':                                    return 'jpg'
+            if h[:4] == b'\x89PNG':                                          return 'png'
+            if h[:4] == b'RIFF' and len(h) >= 12 and h[8:12] == b'WEBP':     return 'webp'
+            if h[:4] == b'RIFF':                                             return 'webp'
+            if h[:6] in (b'GIF87a', b'GIF89a'):                              return 'gif'
+            if h[:2] == b'BM':                                               return 'bmp'
+            if h[:4] in (b'II*\x00', b'MM\x00*'):                            return 'tiff'
+            if len(h) >= 12 and h[4:8] == b'ftyp':                           return 'heic'
+            return 'jpg'
+
+          def is_valid_image(path, min_bytes=5000):
+            if not os.path.exists(path): return False
+            if os.path.getsize(path) < min_bytes: return False
+            with open(path, 'rb') as f:
+              h = f.read(12)
+            return (h[:3] == b'\xff\xd8\xff' or h[:4] == b'\x89PNG' or h[:4] == b'RIFF' or
+                    h[:6] in (b'GIF87a', b'GIF89a') or h[:2] == b'BM' or
+                    h[:4] in (b'II*\x00', b'MM\x00*') or
+                    (len(h) >= 8 and h[4:8] == b'ftyp'))
+
+          def finalize_thumb(tmp_path, index=0, time_s=0):
+            ext = detect_image_ext(tmp_path)
+            final_path = f"{thumb_dir}/thumb_{index}.{ext}"
+            if tmp_path != final_path:
+              os.replace(tmp_path, final_path)
+            return final_path, ext
+
+          def extract_frame(video, out_path, time_pct=0.07):
+            t = max(1.0, duration * time_pct)
+            r = subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-ss',f'{t:.2f}',
+              '-i',video,'-vframes','1','-vf','scale=1280:-2','-q:v','2','-y',out_path], capture_output=True)
+            return r.returncode == 0 and is_valid_image(out_path)
+
+          if thumb_url:
+            tmp = f"{thumb_dir}/thumb_0.tmp"
+            print(f"  Descarregando thumbnail: {thumb_url}")
+            subprocess.run(['curl','-L','--retry','5','--retry-delay','3','--max-time','60',
+              '-H','User-Agent: Mozilla/5.0','-o',tmp,thumb_url], capture_output=True)
+            if not is_valid_image(tmp):
+              if os.path.exists(tmp): os.remove(tmp)
+              subprocess.run(['wget','--timeout=30','--tries=5','-O',tmp,thumb_url], capture_output=True)
+            if is_valid_image(tmp):
+              final_path, ext = finalize_thumb(tmp, 0)
+              thumbs.append({'path':final_path,'ext':ext,'time':0,'index':0})
+              print(f"✓ Thumbnail válida ({os.path.getsize(final_path)//1024} KB, .{ext})")
+            else:
+              if os.path.exists(tmp): os.remove(tmp)
+              out = f"{thumb_dir}/thumb_0.jpg"
+              if extract_frame(video, out):
+                thumbs.append({'path':out,'ext':'jpg','time':0,'index':0})
+                print(f"✓ Frame extraído como fallback")
+              else: print('✗ Falha ao extrair frame')
+          else:
+            out = f"{thumb_dir}/thumb_0.jpg"
+            print(f"  Extraindo frame a 7% ({duration*0.07:.1f}s)")
+            if extract_frame(video, out, time_pct=0.07):
+              thumbs.append({'path':out,'ext':'jpg','time':duration*0.07,'index':0})
+              print(f"✓ Frame extraído: {os.path.getsize(out)//1024} KB")
+            elif extract_frame(video, out, time_pct=0.05):
+              thumbs.append({'path':out,'ext':'jpg','time':duration*0.05,'index':0})
+              print(f"✓ Frame extraído a 5%: {os.path.getsize(out)//1024} KB")
+            else: print('✗ Não foi possível extrair frame')
+
+          json.dump(thumbs, open(os.environ['WORK_DIR'] + '/thumbs_manifest.json', 'w'))
+          print(f"✓ {len(thumbs)} thumbnail(s)")
+          PYEOF
+
+      - name: Encriptar segmentos → .bin
+        run: |
+          python3 << 'PYEOF'
+          import os, json, secrets, struct
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+          key_hex = os.environ['CHACHA_KEY']
+          if len(key_hex) != 64: raise ValueError('CHACHA_KEY inválido')
+          key     = bytes.fromhex(key_hex)
+          hls_dir = os.environ['WORK_DIR'] + '/hls'
+          CHUNK_SIZE = 65536
+
+          def encrypt_segment(data, key):
+            chunks = [data[i:i+CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
+            out    = [struct.pack('<I', len(chunks))]
+            for chunk in chunks:
+              nonce       = secrets.token_bytes(12)
+              nonce_field = struct.pack('<I', 1) + nonce
+              ct          = Cipher(algorithms.ChaCha20(key, nonce_field), None).encryptor().update(chunk)
+              out.append(nonce)
+              out.append(struct.pack('<I', len(ct)))
+              out.append(ct)
+            return b''.join(out)
+
+          nonce_map = {}
+          init_src  = os.path.join(hls_dir, 'init.mp4')
+          if os.path.exists(init_src):
+            with open(init_src, 'rb') as f: data = f.read()
+            encrypted = encrypt_segment(data, key)
+            with open(os.path.join(hls_dir, 'init.bin'), 'wb') as f: f.write(encrypted)
+            os.remove(init_src)
+            nonce_map['init.bin'] = f"chunked:{struct.unpack('<I', encrypted[:4])[0]}"
+            print(f"  init.mp4 → init.bin ({len(data)//1024}KB)")
+
+          seg_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.m4s'))
+          if not seg_files: raise RuntimeError('Nenhum .m4s encontrado')
+
+          for fname in seg_files:
+            with open(os.path.join(hls_dir, fname), 'rb') as f: data = f.read()
+            encrypted = encrypt_segment(data, key)
+            bin_name = fname.replace('.m4s', '.bin')
+            with open(os.path.join(hls_dir, bin_name), 'wb') as f: f.write(encrypted)
+            os.remove(os.path.join(hls_dir, fname))
+            nonce_map[bin_name] = f"chunked:{struct.unpack('<I', encrypted[:4])[0]}"
+
+          out = {'key_id': os.environ['CHACHA_KEY'][:8], 'format': 'chunk-v2', 'nonces': nonce_map}
+          json.dump(out, open(os.environ['WORK_DIR'] + '/nonces.json','w'))
+          print(f"✓ {len(seg_files)} segmentos encriptados")
+          PYEOF
+
+      - name: Libertar espaço — remover vídeo fonte e temporários de torrent
+        if: always()
+        run: |
+          echo "Espaço em disco antes da limpeza:"
+          df -h "$WORK_DIR" 2>/dev/null | tail -1 || true
+          rm -rf "$WORK_DIR/incoming"
+          rm -f /tmp/input.torrent /tmp/coord.torrent
+          rm -rf /tmp/coord_meta
+          echo "✓ Vídeo fonte e ficheiros temporários de torrent removidos"
+          echo "Espaço em disco depois da limpeza:"
+          df -h "$WORK_DIR" 2>/dev/null | tail -1 || true
+
+      # ═══════════════════════════════════════════════════════════════════
+      # GIT-SHARD — inalterado na lógica interna (retries de git/rate-limit
+      # mantidos); só a origem do owner/token muda (STORAGE_TARGET_* em vez
+      # de STORAGE_GITHUB_* — resolvido no step "Resolver credenciais de
+      # armazenamento", logo após a instalação de dependências)
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: Escolher shard de storage
+        env:
+          STORAGE_TOKEN: ${{ env.STORAGE_TARGET_TOKEN }}
+          STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
+        run: |
+          python3 << 'PYEOF'
+          import os, subprocess, json, time, random
+
+          THRESHOLD_KB = 3_500 * 1024
+          MAX_SHARDS_TO_SCAN = 20
+          owner = os.environ['STORAGE_OWNER']
+          token = os.environ['STORAGE_TOKEN']
+          shard_cache = {}
+
+          def api(method, path, data=None):
+            cmd = ['curl','-s','-w','\n%{http_code}','-X',method,
+                   '-H',f'Authorization: Bearer {token}',
+                   '-H','Accept: application/vnd.github+json',
+                   f'https://api.github.com{path}']
+            if data is not None:
+              cmd += ['-d', json.dumps(data)]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            out = r.stdout
+            if '\n' in out:
+              body, _, code = out.rpartition('\n')
+            else:
+              body, code = '', out
+            try:
+              return int(code.strip()), body
+            except ValueError:
+              return 0, body
+
+          def get_repo_size_kb(repo, max_attempts=4):
+            last_code = 0
+            for attempt in range(1, max_attempts + 1):
+              code, out = api('GET', f'/repos/{owner}/{repo}')
+              if code == 200:
+                return True, json.loads(out).get('size', 0)
+              if code == 404:
+                return False, 0
+              last_code = code
+              wait = [3, 8, 15, 25][min(attempt - 1, 3)]
+              print(f"  ⚠ GET {repo} → HTTP {code or 'sem resposta'} (não é 404, pode ser transitório) — tentativa {attempt}/{max_attempts}, aguarda {wait}s...")
+              time.sleep(wait)
+            print(f"  ✗ GET {repo} falhou persistentemente após {max_attempts} tentativas (último HTTP {last_code})")
+            return None, 0
+
+          def create_repo(repo):
+            cc, cout = api('POST', '/user/repos', {'name': repo, 'private': False, 'auto_init': True})
+            if cc == 201:
+              return True
+            if cc == 422:
+              print(f"  ⚠ {repo} já existe (criado concorrentemente por outro job) — reutilizando")
+              return True
+            print(f"  ✗ Falha ao criar {repo}: HTTP {cc} {cout[:200]}")
+            return False
+
+          def pick_shard():
+            eligible = []
+            n = 1
+            while n <= MAX_SHARDS_TO_SCAN:
+              repo = f'compiled{n:02d}'
+
+              if repo in shard_cache:
+                size_kb = shard_cache[repo]
+                exists_here = True
+              else:
+                existe, size_kb = get_repo_size_kb(repo)
+
+                if existe is None:
+                  raise SystemExit(1)
+
+                if not existe:
+                  break
+
+                shard_cache[repo] = size_kb
+                exists_here = True
+
+              size_mb = size_kb // 1024
+              print(f"  {repo}: {size_mb}MB")
+
+              if size_kb < THRESHOLD_KB:
+                eligible.append(repo)
+
+              n += 1
+
+            if eligible:
+              chosen = random.choice(eligible)
+              print(f"  → {len(eligible)} shard(s) elegível(eis): {eligible} — escolhido aleatoriamente: {chosen}")
+              return chosen
+
+            new_repo = f'compiled{n:02d}'
+            print(f"  → nenhum shard com espaço livre, a criar {new_repo}...")
+            if not create_repo(new_repo):
+              raise SystemExit(1)
+            existe2, size_kb2 = get_repo_size_kb(new_repo)
+            shard_cache[new_repo] = size_kb2 if existe2 else 0
+            return new_repo
+
+          shard = pick_shard()
+          print(f"✓ Shard escolhido: {shard}")
+
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f"SHARD_REPO={shard}\n")
+          PYEOF
+
+      - name: Definir branch exclusiva do job
+        run: |
+          python3 << 'PYEOF'
+          import os, re
+          job_id = os.environ['JOB_ID']
+          safe = re.sub(r'[^A-Za-z0-9._-]', '-', job_id)
+          safe = re.sub(r'\.{2,}', '.', safe).strip('.-')
+          if not safe:
+            safe = 'job'
+          branch = f"job-{safe}"
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f"JOB_BRANCH={branch}\n")
+          print(f"✓ Branch exclusiva do job: {branch}")
+          PYEOF
+
+      - name: Reescrever index.m3u8 com URLs raw.githubusercontent.com
+        env:
+          STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
+        run: |
+          python3 << 'PYEOF'
+          import re, os
+          hls_dir  = os.environ['WORK_DIR'] + '/hls'
+          job_id   = os.environ['JOB_ID']
+          owner    = os.environ['STORAGE_OWNER']
+          shard    = os.environ['SHARD_REPO']
+          branch   = os.environ['JOB_BRANCH']
+          raw_base = f"https://raw.githubusercontent.com/{owner}/{shard}/{branch}/{job_id}"
+
+          with open(hls_dir + '/index.m3u8') as f: content = f.read()
+
+          content = re.sub(
+            r'#EXT-X-MAP:URI="init\.mp4"',
+            f'#EXT-X-MAP:URI="{raw_base}/hls/init.bin"',
+            content
+          )
+          content = re.sub(
+            r'^(seg\d+)\.m4s$',
+            lambda m: f"{raw_base}/hls/{m.group(1)}.bin",
+            content, flags=re.MULTILINE
+          )
+
+          with open(hls_dir + '/index.m3u8', 'w') as f: f.write(content)
+          print(f"✓ index.m3u8 reescrito → {raw_base}/hls/")
+          PYEOF
+
+      - name: Gerar master.m3u8
+        env:
+          STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
+        run: |
+          python3 << 'PYEOF'
+          import os
+          job_id    = os.environ['JOB_ID']
+          owner     = os.environ['STORAGE_OWNER']
+          shard     = os.environ['SHARD_REPO']
+          branch    = os.environ['JOB_BRANCH']
+          work_dir  = os.environ['WORK_DIR']
+          eff_w     = os.environ['EFF_WIDTH']
+          eff_h     = os.environ['EFF_HEIGHT']
+          raw_base  = f"https://raw.githubusercontent.com/{owner}/{shard}/{branch}/{job_id}"
+          hls_dir   = work_dir + '/hls'
+          bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin')
+          if bin_files:
+            total_bytes  = sum(os.path.getsize(os.path.join(hls_dir, f)) for f in bin_files)
+            seg_dur      = int(os.environ['SEG_DURATION'])
+            duration_s   = len(bin_files) * seg_dur
+            real_bitrate = int((total_bytes * 8) / duration_s) if duration_s > 0 else 2000000
+          else:
+            real_bitrate = int(os.environ.get('PROBE_BITRATE') or 2000000)
+          master = '\n'.join(['#EXTM3U','#EXT-X-VERSION:6','',
+            f'#EXT-X-STREAM-INF:BANDWIDTH={real_bitrate},RESOLUTION={eff_w}x{eff_h}',
+            f'{raw_base}/hls/index.m3u8'])
+          with open(work_dir + '/master.m3u8', 'w') as f: f.write(master)
+          print(f"✓ master.m3u8: {eff_w}x{eff_h} | {real_bitrate}bps")
+          PYEOF
+
+      - name: Gerar cdn_urls.json
+        env:
+          STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json
+          work_dir = os.environ['WORK_DIR']
+          job_id   = os.environ['JOB_ID']
+          owner    = os.environ['STORAGE_OWNER']
+          shard    = os.environ['SHARD_REPO']
+          branch   = os.environ['JOB_BRANCH']
+          raw_base = f"https://raw.githubusercontent.com/{owner}/{shard}/{branch}/{job_id}"
+
+          nonces = json.load(open(work_dir + '/nonces.json'))
+          thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
+
+          cdn_urls = [
+            f"{raw_base}/master.m3u8",
+            f"{raw_base}/nonces.json",
+            f"{raw_base}/hls/index.m3u8",
+            f"{raw_base}/hls/init.bin",
+          ]
+
+          seg_names = sorted(bn for bn in nonces['nonces'] if bn != 'init.bin')
+          for bn in seg_names:
+            cdn_urls.append(f"{raw_base}/hls/{bn}")
+
+          cdn_urls += [f"{raw_base}/thumbs/{os.path.basename(t['path'])}" for t in thumbs]
+
+          json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
+          print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs")
+          PYEOF
+
+      - name: Commit + push dos segmentos para o shard (branch exclusiva do job)
+        env:
+          STORAGE_TOKEN: ${{ env.STORAGE_TARGET_TOKEN }}
+          STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
+        run: |
+          set -e
+
+          git config --global core.deltaBaseCacheLimit 2047m
+          git config --global core.looseObjects 0
+          git config --global pack.compression 0
+          git config --global pack.window 0
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+          git config --global repack.useDeltaBaseOffset true
+          git config --global advice.detachedHead false
+
+          REPO_URL="https://x-access-token:${STORAGE_TOKEN}@github.com/${STORAGE_OWNER}/${SHARD_REPO}.git"
+          BATCH_SIZE=250
+
+          rm -rf /tmp/shard
+          mkdir -p /tmp/shard
+          cd /tmp/shard
+          git init -q
+          git checkout -q -b "$JOB_BRANCH"
+          git remote add origin "$REPO_URL"
+          mkdir -p "$JOB_ID/hls" "$JOB_ID/thumbs"
+
+          push_with_retry() {
+            local batch_num="$1" total_batches="$2"
+            local max_attempts=8
+            local attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              echo "→ Lote $batch_num/$total_batches — push tentativa $attempt/$max_attempts..."
+              if git push -q --force origin "$JOB_BRANCH" 2>&1; then
+                echo "✓ Lote $batch_num/$total_batches enviado (tentativa $attempt)"
+                return 0
+              fi
+              local base_wait=$((attempt * 8))
+              local jitter=$((RANDOM % 10))
+              local wait=$((base_wait + jitter))
+              echo "  ⚠ Push do lote $batch_num falhou (rede/RPC transitório — branch exclusiva, sem colisão possível) — retry em ${wait}s..."
+              sleep $wait
+              attempt=$((attempt + 1))
+            done
+            echo "✗ Lote $batch_num/$total_batches falhou após ${max_attempts} tentativas"
+            return 1
+          }
+
+          FILES_TO_SEND=()
+          while IFS= read -r -d '' f; do
+            FILES_TO_SEND+=("hls/$(basename "$f")")
+          done < <(find "$WORK_DIR/hls" -maxdepth 1 -type f -print0 | sort -z)
+
+          FILES_TO_SEND+=("master.m3u8" "nonces.json")
+
+          if [ -d "$WORK_DIR/thumbs" ] && [ -n "$(ls -A "$WORK_DIR/thumbs" 2>/dev/null)" ]; then
+            while IFS= read -r -d '' f; do
+              FILES_TO_SEND+=("thumbs/$(basename "$f")")
+            done < <(find "$WORK_DIR/thumbs" -maxdepth 1 -type f -print0 | sort -z)
+          fi
+
+          TOTAL=${#FILES_TO_SEND[@]}
+          NUM_BATCHES=$(( (TOTAL + BATCH_SIZE - 1) / BATCH_SIZE ))
+          echo "→ $TOTAL ficheiro(s) a enviar em $NUM_BATCHES lote(s) de até $BATCH_SIZE na branch $JOB_BRANCH"
+
+          idx=0
+          batch_num=0
+          while [ $idx -lt $TOTAL ]; do
+            batch_num=$((batch_num + 1))
+            batch=("${FILES_TO_SEND[@]:idx:BATCH_SIZE}")
+
+            cd /tmp/shard
+            for rel in "${batch[@]}"; do
+              mkdir -p "$JOB_ID/$(dirname "$rel")"
+              cp "$WORK_DIR/$rel" "$JOB_ID/$rel"
+            done
+
+            git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site add "$JOB_ID"
+            git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit \
+              -m "job=${JOB_ID} lote=${batch_num}/${NUM_BATCHES}" -q || true
+
+            if ! push_with_retry "$batch_num" "$NUM_BATCHES"; then
+              cd /
+              rm -rf /tmp/shard
+              echo "✗ Envio interrompido no lote $batch_num/$NUM_BATCHES"
+              exit 1
+            fi
+
+            idx=$((idx + BATCH_SIZE))
+          done
+
+          cd /
+          rm -rf /tmp/shard
+          echo "✓ Todos os $NUM_BATCHES lote(s) enviados para ${SHARD_REPO}@${JOB_BRANCH}: ${JOB_ID}"
+
+      - name: Registar no EdgeOne (Turso + KV)
+        continue-on-error: true
+        env:
+          METADATA:       ${{ inputs.metadata }}
+          SEASON_NUMBER:  ${{ inputs.season_number }}
+          EPISODE_NUMBER: ${{ inputs.episode_number }}
+          EPISODE_TITLE:  ${{ inputs.episode_title }}
+          FILE_INDICES:   ${{ inputs.file_indices }}
+          STORAGE_OWNER:  ${{ env.STORAGE_TARGET_OWNER }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request, urllib.error, datetime, time
+
+          pipeline_api = os.environ.get('PIPELINE_API','').rstrip('/')
+          if not pipeline_api: print('⚠ PIPELINE_API não configurado'); raise SystemExit(0)
+
+          work_dir     = os.environ['WORK_DIR']
+          job_id       = os.environ['JOB_ID']
+          quality      = os.environ.get('QUALITY_LABEL', '')
+          seg_dur      = int(os.environ.get('SEG_DURATION', '4') or '4')
+          storage_owner = os.environ['STORAGE_OWNER']
+          shard_repo    = os.environ['SHARD_REPO']
+          job_branch    = os.environ['JOB_BRANCH']
+          raw_base      = f"https://raw.githubusercontent.com/{storage_owner}/{shard_repo}/{job_branch}/{job_id}"
+
+          try:    metadata = json.loads(os.environ.get('METADATA','{}'))
+          except: metadata = {}
+
+          probe = json.load(open(os.path.join(work_dir, 'probe_parsed.json')))
+
+          eff_w = int(os.environ.get('EFF_WIDTH', '0') or '0')
+          eff_h = int(os.environ.get('EFF_HEIGHT', '0') or '0')
+
+          nonces    = json.load(open(os.path.join(work_dir, 'nonces.json')))
+          seg_count = len([k for k in nonces['nonces'] if k != 'init.bin'])
+
+          thumbs_path   = os.path.join(work_dir, 'thumbs_manifest.json')
+          thumbs        = json.load(open(thumbs_path)) if os.path.exists(thumbs_path) else []
+          thumb_urls    = [f"{raw_base}/thumbs/{os.path.basename(t['path'])}" for t in thumbs]
+
+          cdn_urls_path = os.path.join(work_dir, 'cdn_urls.json')
+          cdn_urls      = json.load(open(cdn_urls_path)) if os.path.exists(cdn_urls_path) else []
+
+          content_id = metadata.get('contentId', job_id)
+
+          season_number_env  = os.environ.get('SEASON_NUMBER', '0') or '0'
+          episode_number_env = os.environ.get('EPISODE_NUMBER', '') or ''
+          episode_title_env  = os.environ.get('EPISODE_TITLE', '') or ''
+
+          body = {
+            'contentId':content_id,'title':metadata.get('title','Untitled'),'description':metadata.get('description',''),
+            'type':metadata.get('type','movie'),'year':int(metadata.get('year') or datetime.datetime.now().year),
+            'lang':metadata.get('lang','en'),'duration':round(probe.get('duration', 0)),'thumbnail':thumb_urls[0] if thumb_urls else '',
+            'thumbnails':thumb_urls,'qualities':[quality] if quality else [],'width':eff_w,'height':eff_h,'codec':'h264','fps':probe.get('fps', 24),
+            'bitrate':probe.get('bitrate', 0),'segmentCount':seg_count,'segDuration':seg_dur,'videoID':job_id,'cdnUrls':cdn_urls,
+            'encrypted':True,'encryption':'chacha20-chunk-v2','container':'fmp4','segExt':'bin',
+            'masterUrl':f"{raw_base}/master.m3u8",'noncesUrl':f"{raw_base}/nonces.json",
+            'storageRepo': shard_repo, 'storageOwner': storage_owner, 'storageBranch': job_branch,
+            'seasonNumber':season_number_env,'episodeNumber':episode_number_env,'episodeTitle':episode_title_env,
+          }
+          payload = json.dumps(body).encode()
+          for attempt in range(1, 6):
+            req = urllib.request.Request(f"{pipeline_api}/api/pipeline/register", data=payload,
+              headers={'Content-Type':'application/json','X-API-Key':os.environ.get('ADMIN_API_KEY','')}, method='POST')
+            try:
+              with urllib.request.urlopen(req, timeout=30) as r: print(f"✓ Conteúdo registado ({r.status})"); break
+            except urllib.error.HTTPError as e:
+              if e.code < 500 and e.code != 429: print(f"  Erro cliente ({e.code})"); break
+              print(f"⚠ Tentativa {attempt} — HTTP {e.code}")
+            except Exception as e: print(f"⚠ Tentativa {attempt} — {e}")
+            if attempt < 5:
+              time.sleep([5,10,20,40][attempt-1])
+          print("✓ Registo concluído")
+          PYEOF
+
+      - name: Notificar dispatcher (webhook FIFO)
+        if: success() || failure()
+        continue-on-error: true
+        run: |
+          if [ -z "$DISPATCHER_URL" ]; then
+            echo "⚠ DISPATCHER_URL não configurado — webhook ignorado"
+            exit 0
+          fi
+          EFFECTIVE_JOB_ID="${JOB_ID:-${{ inputs.job_id }}}"
+          if [ -z "$EFFECTIVE_JOB_ID" ]; then
+            echo "⚠ job_id indisponível — webhook ignorado (não há job pra notificar)"
+            exit 0
+          fi
+          if [ "${{ job.status }}" = "success" ]; then
+            WEBHOOK_STATUS="done"
+          else
+            WEBHOOK_STATUS="failed"
+          fi
+          WEBHOOK_URL="${DISPATCHER_URL%/}/webhook"
+          echo "→ POST ${WEBHOOK_URL} (job_id=${EFFECTIVE_JOB_ID}, status=${WEBHOOK_STATUS})"
+
+          # LEVE: --retry 3 → 2, --retry-delay 5 → 3 — é só um webhook
+          # informativo (o dispatcher já tem o job registado localmente),
+          # não vale a pena o mesmo esforço de retry do push de storage.
+          HTTP_CODE=$(curl -s -o /tmp/wh_resp.txt -w '%{http_code}' -X POST \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${ADMIN_API_KEY}" \
+            --max-time 20 --retry 2 --retry-delay 3 \
+            "${WEBHOOK_URL}" \
+            -d "{\"job_id\":\"${EFFECTIVE_JOB_ID}\",\"status\":\"${WEBHOOK_STATUS}\"}") || true
+
+          if [[ "$HTTP_CODE" =~ ^2 ]]; then
+            echo "✓ Webhook enviado (HTTP $HTTP_CODE)"
+          else
+            echo "✗ Webhook falhou (HTTP $HTTP_CODE) — não fatal, resposta:"
+            cat /tmp/wh_resp.txt 2>/dev/null || true
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf "$WORK_DIR"
+          rm -rf /tmp/shard
+          rm -f /tmp/wh_resp.txt /tmp/input.torrent /tmp/coord.torrent
+          rm -rf /tmp/coord_meta
+          echo "✓ Workspace limpo"
