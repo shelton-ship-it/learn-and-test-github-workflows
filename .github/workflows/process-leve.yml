@@ -87,7 +87,12 @@ on:
 
 jobs:
   process:
-    runs-on: ubuntu-latest
+    # Requer: repo dentro de uma GitHub Organization (não conta pessoal) +
+    # GitHub App da Blacksmith instalada nessa org, com acesso a este repo.
+    # 4vcpu é um meio-termo razoável pro workload (ffmpeg + libtorrent);
+    # ajuste pra 2vcpu se quiser render dentro do tier gratuito de 3000min
+    # com folga maior, ou pra 8vcpu se o encode for o gargalo principal.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 340
     # actions:write necessário pro coordinator disparar episódios filhos
     # no próprio repo usando o GITHUB_TOKEN automático — workflow_dispatch
@@ -653,16 +658,26 @@ jobs:
             'bitrate':  int(fmt.get('bit_rate', 0)),
           }
           json.dump(probe, open(os.environ['WORK_DIR'] + '/probe_parsed.json','w'))
-          max_h      = int(os.environ['MAX_H'])
-          eff_h      = min(probe['height'], max_h)
-          will_scale = probe['height'] > max_h
-          eff_w      = round((probe['width'] / probe['height']) * eff_h / 2) * 2 if will_scale else probe['width']
-          h          = eff_h
+          max_h = int(os.environ['MAX_H'])
+          # LEVE: se a fonte já é h264, usar stream copy SEMPRE — mesmo
+          # que a altura passe do teto (max_encode_height). Stream copy
+          # não consegue reescalar (só remuxa o bitstream); manter o teto
+          # nesse caso obrigaria a re-encode completo só pra cortar
+          # resolução, perdendo todo o ganho de velocidade. Trade-off
+          # assumido: fontes h264 acima do teto passam a ser servidas na
+          # resolução original (maior tamanho de arquivo/banda), em troca
+          # de ~metade do tempo de encode.
+          stream_copy = (src_codec == 'h264')
+          if stream_copy:
+            eff_h      = probe['height']
+            eff_w      = probe['width']
+            will_scale = False
+          else:
+            eff_h      = min(probe['height'], max_h)
+            will_scale = probe['height'] > max_h
+            eff_w      = round((probe['width'] / probe['height']) * eff_h / 2) * 2 if will_scale else probe['width']
+          h     = eff_h
           label = ('4k' if h>=2160 else '1440p' if h>=1440 else '1080p' if h>=1080 else '720p' if h>=720 else f'{h}p')
-          # LEVE: STREAM_COPY=true só quando codec fonte já é h264 E não
-          # é preciso reescalar (will_scale=false) — stream copy não
-          # consegue mudar resolução, só remuxar o mesmo stream.
-          stream_copy = (src_codec == 'h264') and (not will_scale)
           with open(os.environ['GITHUB_ENV'], 'a') as f:
             f.write(f"PROBE_DURATION={probe['duration']}\n")
             f.write(f"PROBE_WIDTH={probe['width']}\n")
@@ -985,7 +1000,14 @@ jobs:
           shard_cache = {}
 
           def api(method, path, data=None):
-            cmd = ['curl','-s','-w','\n%{http_code}','-X',method,
+            # -L: segue redirects (301/302). Sem isso, um repo renomeado/
+            # transferido ou um mismatch de maiúsculas no owner devolve
+            # 301 cru — que o código corretamente não trata como "não
+            # existe" (ver FIX #4 acima), mas também nunca resolve,
+            # ficando preso em retry até esgotar tentativas e abortar.
+            # Com -L, o curl segue o redirect e devolve o status FINAL
+            # (200 se o repo existe no destino, 404 se não existe mais).
+            cmd = ['curl','-s','-L','-w','\n%{http_code}','-X',method,
                    '-H',f'Authorization: Bearer {token}',
                    '-H','Accept: application/vnd.github+json',
                    f'https://api.github.com{path}']
