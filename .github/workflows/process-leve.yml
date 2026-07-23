@@ -1,6 +1,10 @@
-name: Process (Leve)
+name: StreamVault Process (Leve)
 
 # ═══════════════════════════════════════════════════════════════════════
+# VERSÃO "LEVE" — variante do process.yml, não substitui o original.
+# Objetivo: reduzir tempo total de execução e redundâncias que aumentam
+# desnecessariamente a superfície de atividade visível na conta GitHub,
+# sem tocar na arquitetura (branch exclusiva por job, sharding, etc.).
 #
 # DIFERENÇAS EM RELAÇÃO AO process.yml:
 #
@@ -85,6 +89,14 @@ jobs:
   process:
     runs-on: ubuntu-latest
     timeout-minutes: 340
+    # actions:write necessário pro coordinator disparar episódios filhos
+    # no próprio repo usando o GITHUB_TOKEN automático — workflow_dispatch
+    # é uma das exceções documentadas em que o token padrão do Actions
+    # PODE disparar outro workflow run (diferente de push/etc, que não
+    # disparam pra evitar loops infinitos).
+    permissions:
+      actions: write
+      contents: read
 
     env:
       WORK_DIR:       /tmp/sv_work/${{ inputs.job_id }}
@@ -117,70 +129,6 @@ jobs:
           python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
 
       # ═══════════════════════════════════════════════════════════════════
-      # ARMAZENAMENTO CRUZADO — resolver credenciais da própria conta e da
-      # conta OPOSTA, uma única vez, logo no início
-      # ═══════════════════════════════════════════════════════════════════
-      # Antes: STORAGE_GITHUB_TOKEN/OWNER apontava sempre pra própria conta
-      # que executava o job — cada conta armazenava só os seus próprios
-      # bins. Agora, cada repo (das duas contas) tem os 4 secrets abaixo
-      # configurados com AS MESMAS credenciais nos dois lados (conta A e
-      # conta B) — o step usa github.repository_owner pra saber "quem sou
-      # eu" e resolve dois conjuntos:
-      #   SELF_TOKEN/SELF_OWNER     → própria conta (usado só pelo
-      #                                coordinator, pra disparar episódios
-      #                                filhos no PRÓPRIO repo — isso nunca
-      #                                muda, é sempre self-dispatch)
-      #   STORAGE_TARGET_TOKEN/OWNER → conta OPOSTA (usado nos steps de
-      #                                shard/push — é onde os bins passam
-      #                                a ser armazenados)
-      # O token nunca é escrito em texto claro nos logs (::add-mask::
-      # aplicado antes de gravar no GITHUB_ENV).
-      #
-      # REQUISITO DE DEPLOY: configurar em AMBOS os repos (conta A e conta
-      # B) os mesmos 4 secrets:
-      #   STORAGE_ACCOUNT_A_OWNER / STORAGE_ACCOUNT_A_TOKEN
-      #   STORAGE_ACCOUNT_B_OWNER / STORAGE_ACCOUNT_B_TOKEN
-      # Cada token precisa de permissão de escrita nos repos de shard da
-      # respectiva conta E de actions:write no repo de process-leve.yml
-      # dessa mesma conta (necessário pro self-dispatch do coordinator).
-      # Se migrado pra GitHub App, use aqui o token de instalação da App
-      # na conta correspondente.
-
-      - name: Resolver credenciais de armazenamento (própria conta + conta cruzada)
-        env:
-          ACCOUNT_A_OWNER: ${{ secrets.STORAGE_ACCOUNT_A_OWNER }}
-          ACCOUNT_A_TOKEN: ${{ secrets.STORAGE_ACCOUNT_A_TOKEN }}
-          ACCOUNT_B_OWNER: ${{ secrets.STORAGE_ACCOUNT_B_OWNER }}
-          ACCOUNT_B_TOKEN: ${{ secrets.STORAGE_ACCOUNT_B_TOKEN }}
-        run: |
-          SELF_OWNER="${{ github.repository_owner }}"
-
-          if [ "$SELF_OWNER" = "$ACCOUNT_A_OWNER" ]; then
-            SELF_TOKEN="$ACCOUNT_A_TOKEN"
-            TARGET_OWNER="$ACCOUNT_B_OWNER"
-            TARGET_TOKEN="$ACCOUNT_B_TOKEN"
-          elif [ "$SELF_OWNER" = "$ACCOUNT_B_OWNER" ]; then
-            SELF_TOKEN="$ACCOUNT_B_TOKEN"
-            TARGET_OWNER="$ACCOUNT_A_OWNER"
-            TARGET_TOKEN="$ACCOUNT_A_TOKEN"
-          else
-            echo "ERRO: github.repository_owner ($SELF_OWNER) não corresponde a STORAGE_ACCOUNT_A_OWNER nem STORAGE_ACCOUNT_B_OWNER — secrets desalinhados entre os dois repos."
-            exit 1
-          fi
-
-          if [ -z "$TARGET_OWNER" ] || [ -z "$TARGET_TOKEN" ] || [ -z "$SELF_TOKEN" ]; then
-            echo "ERRO: credenciais resolvidas mas algum valor ficou vazio — confira os secrets STORAGE_ACCOUNT_*_OWNER/TOKEN nos dois repos."
-            exit 1
-          fi
-
-          echo "::add-mask::$TARGET_TOKEN"
-          echo "::add-mask::$SELF_TOKEN"
-          echo "SELF_TOKEN=$SELF_TOKEN"               >> "$GITHUB_ENV"
-          echo "STORAGE_TARGET_OWNER=$TARGET_OWNER"   >> "$GITHUB_ENV"
-          echo "STORAGE_TARGET_TOKEN=$TARGET_TOKEN"   >> "$GITHUB_ENV"
-          echo "✓ A executar na conta: $SELF_OWNER → bins serão armazenados na conta: $TARGET_OWNER"
-
-      # ═══════════════════════════════════════════════════════════════════
       # COORDINATOR (séries/anime/dorama)
       # ═══════════════════════════════════════════════════════════════════
 
@@ -205,7 +153,12 @@ jobs:
           INPUT_SEG:         ${{ inputs.seg_duration }}
           INPUT_HEIGHT:      ${{ inputs.max_encode_height }}
           INPUT_SEASON:      ${{ inputs.season_number }}
-          STORAGE_TOKEN:     ${{ env.SELF_TOKEN }}
+          # workflow_dispatch é uma exceção documentada — o GITHUB_TOKEN
+          # automático PODE disparar outro workflow_dispatch no mesmo
+          # repo (diferente de eventos como push, que não disparam, pra
+          # evitar loops infinitos). Elimina a necessidade de token
+          # próprio só pra esse self-dispatch.
+          STORAGE_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python3 << 'PYEOF'
@@ -932,10 +885,89 @@ jobs:
           df -h "$WORK_DIR" 2>/dev/null | tail -1 || true
 
       # ═══════════════════════════════════════════════════════════════════
+      # STORAGE (conta separada) — token de instalação da App gerado TARDE,
+      # só agora (após encode/thumbnails/encriptação), nunca no início
+      # ═══════════════════════════════════════════════════════════════════
+      # Um installation access token da GitHub App expira em 1h — o job
+      # inteiro pode rodar até 340min (quase 6h). Gerar o token no início
+      # do job faria ele expirar antes do push, em jobs de encode mais
+      # longos. Por isso este step fica aqui, o mais tarde possível: o
+      # que resta depois dele (shard, push, registo, webhook) é rápido
+      # o suficiente pra caber dentro da janela de 1h.
+      #
+      # Setup: 1 conta roda o workflow (esta), 1 conta separada só recebe
+      # o storage — não há round-robin nem descoberta de "qual conta sou
+      # eu", é sempre a mesma conta de destino fixa.
+      #
+      # REQUISITO DE DEPLOY (só neste repo, o que roda o workflow):
+      #   STORAGE_OWNER, STORAGE_APP_ID, STORAGE_INSTALLATION_ID,
+      #   STORAGE_PRIVATE_KEY — credenciais da GitHub App instalada na
+      #   conta de storage, com permissão Contents: Read and write nos
+      #   repos de shard dessa conta.
+
+      - name: Gerar token de instalação da App (conta de storage)
+        env:
+          STORAGE_OWNER:          ${{ secrets.STORAGE_OWNER }}
+          STORAGE_APP_ID:         ${{ secrets.STORAGE_APP_ID }}
+          STORAGE_INSTALLATION_ID: ${{ secrets.STORAGE_INSTALLATION_ID }}
+          STORAGE_PRIVATE_KEY:    ${{ secrets.STORAGE_PRIVATE_KEY }}
+        run: |
+          python3 << 'PYEOF'
+          import os, time, json, base64, urllib.request, urllib.error
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import padding
+
+          target_owner    = os.environ['STORAGE_OWNER']
+          app_id          = os.environ['STORAGE_APP_ID']
+          installation_id = os.environ['STORAGE_INSTALLATION_ID']
+          private_key_pem = os.environ['STORAGE_PRIVATE_KEY']
+
+          if not all([target_owner, app_id, installation_id, private_key_pem]):
+            print("ERRO: alguma credencial da App de storage ficou vazia — confira os secrets STORAGE_OWNER/APP_ID/INSTALLATION_ID/PRIVATE_KEY.")
+            raise SystemExit(1)
+
+          def b64url(data: bytes) -> str:
+            return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+          now    = int(time.time())
+          header = {"alg": "RS256", "typ": "JWT"}
+          # iat com margem de 60s pra tolerância de relógio; exp em 9min
+          # (teto do GitHub é 10min) — este JWT só serve pra pedir o
+          # installation token logo a seguir, nunca é reutilizado.
+          payload = {"iat": now - 60, "exp": now + 9 * 60, "iss": app_id}
+          signing_input = f"{b64url(json.dumps(header).encode())}.{b64url(json.dumps(payload).encode())}"
+
+          key = serialization.load_pem_private_key(private_key_pem.encode(), password=None)
+          signature = key.sign(signing_input.encode(), padding.PKCS1v15(), hashes.SHA256())
+          jwt_token = f"{signing_input}.{b64url(signature)}"
+
+          req = urllib.request.Request(
+            f"https://api.github.com/app/installations/{installation_id}/access_tokens",
+            method="POST",
+            headers={
+              "Authorization":        f"Bearer {jwt_token}",
+              "Accept":               "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+            },
+          )
+          try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+              data = json.loads(r.read())
+          except urllib.error.HTTPError as e:
+            print(f"ERRO: falha ao gerar installation token: HTTP {e.code} {e.read().decode()[:300]}")
+            raise SystemExit(1)
+
+          token = data['token']
+          print(f"::add-mask::{token}")
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f"STORAGE_TARGET_OWNER={target_owner}\n")
+            f.write(f"STORAGE_TARGET_TOKEN={token}\n")
+          print(f"✓ Token de instalação gerado para conta de storage: {target_owner} (expira {data['expires_at']})")
+          PYEOF
+
+      # ═══════════════════════════════════════════════════════════════════
       # GIT-SHARD — inalterado na lógica interna (retries de git/rate-limit
-      # mantidos); só a origem do owner/token muda (STORAGE_TARGET_* em vez
-      # de STORAGE_GITHUB_* — resolvido no step "Resolver credenciais de
-      # armazenamento", logo após a instalação de dependências)
+      # mantidos); STORAGE_TARGET_TOKEN/OWNER vêm do step acima
       # ═══════════════════════════════════════════════════════════════════
 
       - name: Escolher shard de storage
