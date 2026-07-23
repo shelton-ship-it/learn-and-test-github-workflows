@@ -127,6 +127,19 @@ jobs:
         with:
           packages: ffmpeg python3-libtorrent
           version: 1.0
+          # FIX: a ação restaura pacotes via dpkg -x (só extrai arquivos),
+          # sem rodar scripts de pós-instalação por padrão — isso deixava
+          # bibliotecas como libblas.so.3 (dependência transitiva de
+          # python3-libtorrent) no disco, mas fora do cache do linker
+          # (ldconfig), causando "error while loading shared libraries"
+          # no ffprobe/ffmpeg. execute_install_scripts roda esses scripts
+          # no restore, incluindo a atualização do ldconfig.
+          execute_install_scripts: true
+
+      # Defesa extra, independente do que a ação já faz: força o cache
+      # do linker a refletir tudo que foi restaurado, cache-hit ou não.
+      - name: Atualizar cache do linker (ldconfig)
+        run: sudo ldconfig
 
       - name: Instalar dependências Python (pip)
         run: |
@@ -409,6 +422,19 @@ jobs:
           print(f"\n✅ Coordinator: {ok_count}/{len(children)} episódio(s) disparados em paralelo" + (f" | ✗ {fail_count} falha(s)" if fail_count else ""))
           if ok_count == 0:
             sys.exit(1)
+
+          # CIRÚRGICO: sys.exit(0) aqui só encerra ESTE step — o GitHub
+          # Actions continua os steps seguintes normalmente (download,
+          # encode, push...), que tentariam processar o torrent INTEIRO
+          # de novo no job "pai", só que agora sem sentido (os episódios
+          # já foram disparados como jobs filhos separados). Isso
+          # desperdiçava o tempo de job inteiro à toa — e "Registar no
+          # EdgeOne" chegava a registrar conteúdo vazio/lixo pra esse
+          # job_id. A flag abaixo é checada no `if:` de todos os steps
+          # entre aqui e o webhook final, pra pulá-los quando o
+          # coordinator já tiver assumido o trabalho.
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write("COORDINATOR_DISPATCHED=true\n")
           sys.exit(0)
           PYEOF
 
@@ -417,7 +443,7 @@ jobs:
       # ═══════════════════════════════════════════════════════════════════
 
       - name: '[Modo A] Descarregar vídeo'
-        if: inputs.video_url != ''
+        if: inputs.video_url != '' && env.COORDINATOR_DISPATCHED != 'true'
         run: |
           URL="${{ inputs.video_url }}"
           if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]] || [[ "$URL" == *infohash:* ]]; then
@@ -582,6 +608,7 @@ jobs:
           path: ${{ env.WORK_DIR }}/incoming/
 
       - name: Detectar ficheiro de vídeo (+ extrair .rar/.zip se necessário)
+        if: env.COORDINATOR_DISPATCHED != 'true'
         run: |
           VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg video"
           FILE_INDICES="${{ inputs.file_indices }}"
@@ -644,6 +671,7 @@ jobs:
           echo "✓ Vídeo: $VIDEO_PATH ($(du -sh "$VIDEO_PATH" | cut -f1))"
 
       - name: Probe do vídeo
+        if: env.COORDINATOR_DISPATCHED != 'true'
         run: |
           ffprobe -v quiet -print_format json -show_streams -show_format "$VIDEO_PATH" > "$WORK_DIR/probe.json"
           python3 << 'PYEOF'
@@ -700,6 +728,7 @@ jobs:
           PYEOF
 
       - name: HLS encode (stream copy se h264 nativo, senão libx264 ultrafast CRF26)
+        if: env.COORDINATOR_DISPATCHED != 'true'
         run: |
           HLS_DIR="$WORK_DIR/hls"
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
@@ -771,6 +800,7 @@ jobs:
           echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
 
       - name: Obter thumbnails
+        if: env.COORDINATOR_DISPATCHED != 'true'
         env:
           INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
         run: |
@@ -856,6 +886,7 @@ jobs:
           PYEOF
 
       - name: Encriptar segmentos → .bin
+        if: env.COORDINATOR_DISPATCHED != 'true'
         run: |
           python3 << 'PYEOF'
           import os, json, secrets, struct
@@ -938,6 +969,7 @@ jobs:
       #   repos de shard dessa conta.
 
       - name: Gerar token de instalação da App (conta de storage)
+        if: env.COORDINATOR_DISPATCHED != 'true'
         env:
           STORAGE_OWNER:          ${{ secrets.STORAGE_OWNER }}
           STORAGE_APP_ID:         ${{ secrets.STORAGE_APP_ID }}
@@ -1003,6 +1035,7 @@ jobs:
       # ═══════════════════════════════════════════════════════════════════
 
       - name: Escolher shard de storage
+        if: env.COORDINATOR_DISPATCHED != 'true'
         env:
           STORAGE_TOKEN: ${{ env.STORAGE_TARGET_TOKEN }}
           STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
@@ -1116,6 +1149,7 @@ jobs:
           PYEOF
 
       - name: Definir branch exclusiva do job
+        if: env.COORDINATOR_DISPATCHED != 'true'
         run: |
           python3 << 'PYEOF'
           import os, re
@@ -1131,6 +1165,7 @@ jobs:
           PYEOF
 
       - name: Reescrever index.m3u8 com URLs raw.githubusercontent.com
+        if: env.COORDINATOR_DISPATCHED != 'true'
         env:
           STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
         run: |
@@ -1161,6 +1196,7 @@ jobs:
           PYEOF
 
       - name: Gerar master.m3u8
+        if: env.COORDINATOR_DISPATCHED != 'true'
         env:
           STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
         run: |
@@ -1191,6 +1227,7 @@ jobs:
           PYEOF
 
       - name: Gerar cdn_urls.json
+        if: env.COORDINATOR_DISPATCHED != 'true'
         env:
           STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
         run: |
@@ -1224,6 +1261,7 @@ jobs:
           PYEOF
 
       - name: Commit + push dos segmentos para o shard (branch exclusiva do job)
+        if: env.COORDINATOR_DISPATCHED != 'true'
         env:
           STORAGE_TOKEN: ${{ env.STORAGE_TARGET_TOKEN }}
           STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
@@ -1324,6 +1362,7 @@ jobs:
           echo "✓ Todos os $NUM_BATCHES lote(s) enviados para ${SHARD_REPO}@${JOB_BRANCH}: ${JOB_ID}"
 
       - name: Registar no EdgeOne (Turso + KV)
+        if: env.COORDINATOR_DISPATCHED != 'true'
         continue-on-error: true
         env:
           METADATA:       ${{ inputs.metadata }}
