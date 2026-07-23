@@ -448,7 +448,19 @@ jobs:
           URL="${{ inputs.video_url }}"
           if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]] || [[ "$URL" == *infohash:* ]]; then
             echo "→ Modo torrent (libtorrent Python)"
-            python3 << 'PYEOF'
+            # CIRÚRGICO: segfault (código 139) é bug conhecido do binding
+            # Python do libtorrent sob rajada de alertas de tracker — não
+            # é falha determinística do vídeo/torrent em si, costuma ser
+            # condição de corrida na ordem de resposta dos trackers.
+            # Retry limpo só nesse código específico; qualquer outra
+            # falha (torrent morto, sem seeders etc.) continua abortando
+            # na hora, sem retry.
+            DL_ATTEMPTS=1
+            DL_MAX_ATTEMPTS=2
+            DL_RC=1
+            while [ $DL_ATTEMPTS -le $DL_MAX_ATTEMPTS ]; do
+              echo "  Tentativa $DL_ATTEMPTS/$DL_MAX_ATTEMPTS..."
+              python3 << 'PYEOF'
           import libtorrent as lt
           import os, sys, time, pathlib
 
@@ -474,6 +486,16 @@ jobs:
             tracker_replied = False
             for a in ses.pop_alerts():
               name = type(a).__name__
+              # CIRÚRGICO: tracker_announce_alert não entra na lógica de
+              # early-fail (só informa "enviando announce") mas é o alerta
+              # de maior volume — dispara pra cada tracker da lista (~25
+              # no magnet típico) x2 (IPv4 local + rota real), tudo nos
+              # primeiros segundos de sessão. Pular ANTES de chamar
+              # a.message() evita essa rajada de chamadas nesse binding,
+              # justamente a janela onde o segfault (SIGSEGV/139) do
+              # binding Python do libtorrent foi observado.
+              if 'tracker_announce' in name:
+                continue
               try:
                 msg = a.message()
               except Exception:
@@ -485,8 +507,6 @@ jobs:
                 print(f"  ✓ {name}: {msg}")
               elif 'tracker_warning' in name:
                 print(f"  ⚠ {name}: {msg}")
-              elif 'tracker_announce' in name:
-                print(f"  → {name}: {msg}")
             return tracker_replied
 
           params = lt.add_torrent_params()
@@ -583,6 +603,22 @@ jobs:
             print('⚠ Nenhum vídeo encontrado no torrent')
             for f in files: print(f'  {f} ({f.stat().st_size} bytes)')
           PYEOF
+              DL_RC=$?
+              if [ $DL_RC -eq 0 ]; then
+                break
+              elif [ $DL_RC -eq 139 ]; then
+                echo "  ⚠ libtorrent crashou (segfault, código 139) — bug conhecido do binding Python em rajada de alertas de tracker, não do vídeo/torrent. Retry limpo..."
+                rm -rf "$WORK_DIR/incoming"/* 2>/dev/null || true
+              else
+                echo "  ✗ Download falhou com código $DL_RC (não é segfault) — sem retry, motivo provavelmente não-transitório"
+                exit $DL_RC
+              fi
+              DL_ATTEMPTS=$((DL_ATTEMPTS + 1))
+            done
+            if [ $DL_RC -ne 0 ]; then
+              echo "✗ Download via torrent falhou após $DL_MAX_ATTEMPTS tentativa(s)"
+              exit 1
+            fi
           else
             echo "→ Modo URL directa (curl)"
             curl -L --retry 3 --retry-delay 5 --progress-bar --fail \
