@@ -87,12 +87,9 @@ on:
 
 jobs:
   process:
-    # Requer: repo dentro de uma GitHub Organization (não conta pessoal) +
-    # GitHub App da Blacksmith instalada nessa org, com acesso a este repo.
-    # 4vcpu é um meio-termo razoável pro workload (ffmpeg + libtorrent);
-    # ajuste pra 2vcpu se quiser render dentro do tier gratuito de 3000min
-    # com folga maior, ou pra 8vcpu se o encode for o gargalo principal.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Conta pessoal — sem Blacksmith. GitHub-hosted runners são
+    # ilimitados e gratuitos pra repositório público no plano Free.
+    runs-on: ubuntu-latest
     timeout-minutes: 340
     # actions:write necessário pro coordinator disparar episódios filhos
     # no próprio repo usando o GITHUB_TOKEN automático — workflow_dispatch
@@ -121,16 +118,20 @@ jobs:
                    "/tmp/sv_work/${{ inputs.job_id }}/hls" \
                    "/tmp/sv_work/${{ inputs.job_id }}/thumbs"
 
-      - name: Instalar FFmpeg
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg
-          ffmpeg -version | head -1
+      # Cache de pacotes .deb via ação da comunidade — evita baixar
+      # ffmpeg + python3-libtorrent (e suas dependências apt) do zero em
+      # todo run. Cache por branch, até 5GB no repo; invalida sozinho se
+      # a lista de pacotes mudar (chave = hash da lista + versão abaixo).
+      - name: Instalar pacotes apt (ffmpeg + libtorrent, cache)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: ffmpeg python3-libtorrent
+          version: 1.0
 
-      - name: Instalar dependências Python + libtorrent
+      - name: Instalar dependências Python (pip)
         run: |
           pip install --quiet --upgrade cryptography
-          sudo apt-get install -y --no-install-recommends python3-libtorrent
+          ffmpeg -version | head -1
           python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
 
       # ═══════════════════════════════════════════════════════════════════
@@ -233,10 +234,14 @@ jobs:
           print("  Aguardando metadados...")
           t0 = time.time()
           tracker_replied = False
-          # LEVE: 180s → 45s — se um tracker/DHT vai responder, responde
-          # nos primeiros 15-30s. 45s ainda dá bootstrap suficiente sem
-          # queimar minutos de plano em torrents mortos.
-          EARLY_FAIL_TIMEOUT = 45
+          # CIRÚRGICO: 45s → 2s. Se não há NENHUM sinal (peer, tracker,
+          # nó DHT) já no segundo check, o torrent está morto — esperar
+          # mais não muda esse resultado, só queima tempo de job. Um job
+          # preso aqui não é gratuito: é tempo de runner + tempo até o
+          # próximo item da fila começar. Trade-off assumido: torrents
+          # legítimos mas muito lentos pra responder também são
+          # cancelados — preferível a deixar jobs mortos ocupando fila.
+          EARLY_FAIL_TIMEOUT = 2
 
           METADATA_TIMEOUT = 900
           while not handle.status().has_metadata:
@@ -503,8 +508,8 @@ jobs:
           stall_t        = time.time()
           stall_bytes    = 0
           tracker_replied = False
-          # LEVE: 180s → 45s (mesmo raciocínio do coordinator)
-          EARLY_FAIL_TIMEOUT = 45
+          # CIRÚRGICO: mesmo raciocínio do coordinator — 2s, não 45s.
+          EARLY_FAIL_TIMEOUT = 2
 
           while True:
             s   = handle.status()
@@ -694,29 +699,37 @@ jobs:
           print(f"  → encode {eff_w}x{eff_h} ({label}) | rescale: {will_scale} | stream_copy: {stream_copy}")
           PYEOF
 
-      - name: HLS encode (stream copy se h264 nativo, senão libx264 superfast CRF26 + AAC 128k)
+      - name: HLS encode (stream copy se h264 nativo, senão libx264 ultrafast CRF26)
         run: |
           HLS_DIR="$WORK_DIR/hls"
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
 
-          # LEVE: reaproveita o PROBE_CODEC já extraído no step "Probe do
-          # vídeo" — se a fonte já é h264 (e não precisa de reescala),
-          # remuxa sem re-encode de vídeo (-c:v copy). Corta o custo de
-          # CPU/tempo do encode de vídeo nesse caso, mantendo só o
-          # re-encode de áudio pra AAC 128k (que é onde a fonte realmente
-          # varia). Fallback automático pra encode completo se o stream
-          # copy falhar.
+          # CIRÚRGICO: quando STREAM_COPY está ativo, o áudio também é
+          # copiado (-c:a copy), não mais re-encodado pra AAC. O player é
+          # hls.js, que já suporta múltiplas faixas/codecs de áudio — o
+          # re-encode de áudio só existia como precaução, sem necessidade
+          # real. Isso reduz mais um pedaço do tempo de job no caso comum
+          # (fonte já em h264). Só volta a re-encodar áudio no modo de
+          # re-encode completo (fonte não-h264), onde já se paga o custo
+          # de CPU do vídeo mesmo.
+          #
+          # CIRÚRGICO: preset trocado de superfast pra ultrafast no modo
+          # de re-encode — prioriza velocidade sobre eficiência de
+          # bitrate/qualidade por bitrate. Jobs não podem levar tempo;
+          # a perda de qualidade nesse preset é aceita deliberadamente.
           if [ "$STREAM_COPY" = "true" ]; then
-            echo "  → STREAM_COPY ativo (fonte já é h264, sem reescala) — sem re-encode de vídeo"
+            echo "  → STREAM_COPY ativo (fonte já é h264, sem reescala) — sem re-encode de vídeo NEM áudio"
             VCODEC_ARGS="-c:v copy"
+            ACODEC_ARGS="-c:a copy"
           else
-            echo "  → Re-encode de vídeo necessário (codec=${PROBE_CODEC} ou reescala=${WILL_SCALE})"
+            echo "  → Re-encode completo necessário (codec=${PROBE_CODEC} ou reescala=${WILL_SCALE})"
             if [ "$WILL_SCALE" = "true" ]; then
               SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}"
             else
               SCALE_ARGS=""
             fi
-            VCODEC_ARGS="$SCALE_ARGS -c:v libx264 -preset superfast -crf 26 -tune fastdecode -profile:v high -level 4.0 -pix_fmt yuv420p -g $GOP -keyint_min ${SEG_DURATION}"
+            VCODEC_ARGS="$SCALE_ARGS -c:v libx264 -preset ultrafast -crf 26 -tune fastdecode -profile:v high -level 4.0 -pix_fmt yuv420p -g $GOP -keyint_min ${SEG_DURATION}"
+            ACODEC_ARGS="-c:a aac -b:a 128k -ac 2"
           fi
 
           echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s) — GOP só se aplica no modo re-encode"
@@ -725,7 +738,7 @@ jobs:
             ffmpeg -hide_banner -loglevel warning -stats \
               -i "$VIDEO_PATH" \
               $VCODEC_ARGS \
-              -c:a aac -b:a 128k -ac 2 \
+              $ACODEC_ARGS \
               -f hls \
               -hls_time ${SEG_DURATION} \
               -hls_playlist_type vod \
@@ -738,14 +751,15 @@ jobs:
 
           if ! run_encode; then
             if [ "$STREAM_COPY" = "true" ]; then
-              echo "  ⚠ Stream copy falhou (container incompatível) — fallback pra re-encode completo"
+              echo "  ⚠ Stream copy falhou (container/codec de áudio incompatível) — fallback pra re-encode completo (vídeo + áudio)"
               rm -f "$HLS_DIR"/*.m4s "$HLS_DIR/init.mp4" "$HLS_DIR/index.m3u8" 2>/dev/null || true
               if [ "$WILL_SCALE" = "true" ]; then
                 SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}"
               else
                 SCALE_ARGS=""
               fi
-              VCODEC_ARGS="$SCALE_ARGS -c:v libx264 -preset superfast -crf 26 -tune fastdecode -profile:v high -level 4.0 -pix_fmt yuv420p -g $GOP -keyint_min ${SEG_DURATION}"
+              VCODEC_ARGS="$SCALE_ARGS -c:v libx264 -preset ultrafast -crf 26 -tune fastdecode -profile:v high -level 4.0 -pix_fmt yuv420p -g $GOP -keyint_min ${SEG_DURATION}"
+              ACODEC_ARGS="-c:a aac -b:a 128k -ac 2"
               run_encode
             else
               echo "✗ Encode falhou (modo re-encode, sem fallback disponível)"
@@ -807,11 +821,14 @@ jobs:
           if thumb_url:
             tmp = f"{thumb_dir}/thumb_0.tmp"
             print(f"  Descarregando thumbnail: {thumb_url}")
-            subprocess.run(['curl','-L','--retry','5','--retry-delay','3','--max-time','60',
+            # CIRÚRGICO: era curl (5 tentativas, até 60s) + wget como
+            # segundo fallback (mais 5 tentativas, até ~150s) — pior caso
+            # de ~3.5min só pra thumbnail, antes de cair no fallback real
+            # (extrair frame do vídeo, que é local e quase instantâneo).
+            # Reduzido pra 1 ferramenta, 2 tentativas, 15s de teto — se
+            # falhar, vai direto pro frame, sem segunda cascata de retry.
+            subprocess.run(['curl','-sL','--retry','2','--retry-delay','2','--max-time','15',
               '-H','User-Agent: Mozilla/5.0','-o',tmp,thumb_url], capture_output=True)
-            if not is_valid_image(tmp):
-              if os.path.exists(tmp): os.remove(tmp)
-              subprocess.run(['wget','--timeout=30','--tries=5','-O',tmp,thumb_url], capture_output=True)
             if is_valid_image(tmp):
               final_path, ext = finalize_thumb(tmp, 0)
               thumbs.append({'path':final_path,'ext':ext,'time':0,'index':0})
@@ -1224,7 +1241,11 @@ jobs:
           git config --global advice.detachedHead false
 
           REPO_URL="https://x-access-token:${STORAGE_TOKEN}@github.com/${STORAGE_OWNER}/${SHARD_REPO}.git"
-          BATCH_SIZE=250
+          # CIRÚRGICO: 250 → 400. Menos lotes = menos round-trips HTTP
+          # (handshake+auth por push), sem aumentar o payload a ponto de
+          # arriscar mais falhas de push grandes — o retry de 8 tentativas
+          # continua cobrindo isso.
+          BATCH_SIZE=400
 
           rm -rf /tmp/shard
           mkdir -p /tmp/shard
