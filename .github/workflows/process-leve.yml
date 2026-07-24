@@ -8,19 +8,24 @@ name: StreamVault Process (Leve)
 #
 # DIFERENÇAS EM RELAÇÃO AO process.yml:
 #
-#   1. STREAM COPY CONDICIONAL (vídeo)
-#      Reaproveita o PROBE_CODEC que já é extraído no step "Probe do
-#      vídeo" — não é uma nova etapa de detecção, é parar de descartar
-#      um dado que já existia. Se a fonte já é h264, usa `-c:v copy`
-#      (sem re-encode de vídeo); caso contrário, mantém o encode
-#      completo como hoje. Áudio continua sempre re-encodado pra AAC
-#      128k, porque é aí que a variação real da fonte está.
+#   1. STREAM COPY CONDICIONAL (vídeo E áudio, decisões INDEPENDENTES)
+#      Reaproveita o PROBE_CODEC/PROBE_AUDIO_CODEC já extraídos no step
+#      "Probe do vídeo" — não é uma nova etapa de detecção, é parar de
+#      descartar dados que já existiam. Vídeo: se a fonte já é h264, usa
+#      `-c:v copy`. Áudio: SÓ usa `-c:a copy` se a fonte já for AAC —
+#      são decisões separadas porque vídeo e áudio são codecs
+#      independentes (um BluRay "DUAL" pode ter vídeo h264 + áudio
+#      AC3/DTS). Copiar áudio não-AAC faz o MSE do navegador rejeitar o
+#      primeiro segmento sem nenhum erro do lado do ffmpeg — bug real já
+#      encontrado em teste com conteúdo real (loop infinito no primeiro
+#      .bin). Caso contrário (codec não suportado em copy), sempre
+#      re-encoda pra AAC 128k, mesmo com vídeo em stream copy.
 #      TRADE-OFF CONHECIDO: com -c:v copy, -g/-keyint_min não têm
 #      efeito (só existem no encoder) — os segmentos HLS cortam nos
 #      keyframes que já existem na fonte, não em seg_duration exato.
 #      Alguns segmentos podem sair maiores que o alvo. Fallback: se o
-#      stream copy falhar (raro — container incompatível), cai para
-#      re-encode completo automaticamente.
+#      stream copy (vídeo ou áudio) falhar no próprio ffmpeg (raro —
+#      container incompatível), cai para re-encode completo automático.
 #
 #   2. EARLY_FAIL_TIMEOUT: 180s → 45s (coordinator e download torrent)
 #      Se um tracker/DHT vai responder, responde nos primeiros 15-30s.
@@ -448,19 +453,7 @@ jobs:
           URL="${{ inputs.video_url }}"
           if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]] || [[ "$URL" == *infohash:* ]]; then
             echo "→ Modo torrent (libtorrent Python)"
-            # CIRÚRGICO: segfault (código 139) é bug conhecido do binding
-            # Python do libtorrent sob rajada de alertas de tracker — não
-            # é falha determinística do vídeo/torrent em si, costuma ser
-            # condição de corrida na ordem de resposta dos trackers.
-            # Retry limpo só nesse código específico; qualquer outra
-            # falha (torrent morto, sem seeders etc.) continua abortando
-            # na hora, sem retry.
-            DL_ATTEMPTS=1
-            DL_MAX_ATTEMPTS=2
-            DL_RC=1
-            while [ $DL_ATTEMPTS -le $DL_MAX_ATTEMPTS ]; do
-              echo "  Tentativa $DL_ATTEMPTS/$DL_MAX_ATTEMPTS..."
-              python3 << 'PYEOF'
+            python3 << 'PYEOF'
           import libtorrent as lt
           import os, sys, time, pathlib
 
@@ -486,16 +479,6 @@ jobs:
             tracker_replied = False
             for a in ses.pop_alerts():
               name = type(a).__name__
-              # CIRÚRGICO: tracker_announce_alert não entra na lógica de
-              # early-fail (só informa "enviando announce") mas é o alerta
-              # de maior volume — dispara pra cada tracker da lista (~25
-              # no magnet típico) x2 (IPv4 local + rota real), tudo nos
-              # primeiros segundos de sessão. Pular ANTES de chamar
-              # a.message() evita essa rajada de chamadas nesse binding,
-              # justamente a janela onde o segfault (SIGSEGV/139) do
-              # binding Python do libtorrent foi observado.
-              if 'tracker_announce' in name:
-                continue
               try:
                 msg = a.message()
               except Exception:
@@ -507,6 +490,8 @@ jobs:
                 print(f"  ✓ {name}: {msg}")
               elif 'tracker_warning' in name:
                 print(f"  ⚠ {name}: {msg}")
+              elif 'tracker_announce' in name:
+                print(f"  → {name}: {msg}")
             return tracker_replied
 
           params = lt.add_torrent_params()
@@ -603,22 +588,6 @@ jobs:
             print('⚠ Nenhum vídeo encontrado no torrent')
             for f in files: print(f'  {f} ({f.stat().st_size} bytes)')
           PYEOF
-              DL_RC=$?
-              if [ $DL_RC -eq 0 ]; then
-                break
-              elif [ $DL_RC -eq 139 ]; then
-                echo "  ⚠ libtorrent crashou (segfault, código 139) — bug conhecido do binding Python em rajada de alertas de tracker, não do vídeo/torrent. Retry limpo..."
-                rm -rf "$WORK_DIR/incoming"/* 2>/dev/null || true
-              else
-                echo "  ✗ Download falhou com código $DL_RC (não é segfault) — sem retry, motivo provavelmente não-transitório"
-                exit $DL_RC
-              fi
-              DL_ATTEMPTS=$((DL_ATTEMPTS + 1))
-            done
-            if [ $DL_RC -ne 0 ]; then
-              echo "✗ Download via torrent falhou após $DL_MAX_ATTEMPTS tentativa(s)"
-              exit 1
-            fi
           else
             echo "→ Modo URL directa (curl)"
             curl -L --retry 3 --retry-delay 5 --progress-bar --fail \
@@ -712,26 +681,29 @@ jobs:
           ffprobe -v quiet -print_format json -show_streams -show_format "$VIDEO_PATH" > "$WORK_DIR/probe.json"
           python3 << 'PYEOF'
           import json, os
-          d   = json.load(open(os.environ['WORK_DIR'] + '/probe.json'))
-          vs  = next((s for s in d['streams'] if s['codec_type'] == 'video'), {})
-          fmt = d['format']
+          d     = json.load(open(os.environ['WORK_DIR'] + '/probe.json'))
+          vs    = next((s for s in d['streams'] if s['codec_type'] == 'video'), {})
+          as_   = next((s for s in d['streams'] if s['codec_type'] == 'audio'), {})
+          fmt   = d['format']
           num, den = map(int, vs.get('r_frame_rate','24/1').split('/'))
-          fps       = num / den if den else num
-          src_codec = vs.get('codec_name', 'unknown')
+          fps        = num / den if den else num
+          src_codec  = vs.get('codec_name', 'unknown')
+          audio_codec = as_.get('codec_name', 'unknown')
           probe = {
             'duration': float(fmt.get('duration', 0)),
             'width':    vs.get('width',  1920),
             'height':   vs.get('height', 1080),
             'codec':    src_codec,
+            'audio_codec': audio_codec,
             'fps':      fps,
             'bitrate':  int(fmt.get('bit_rate', 0)),
           }
           json.dump(probe, open(os.environ['WORK_DIR'] + '/probe_parsed.json','w'))
           max_h = int(os.environ['MAX_H'])
-          # LEVE: se a fonte já é h264, usar stream copy SEMPRE — mesmo
-          # que a altura passe do teto (max_encode_height). Stream copy
-          # não consegue reescalar (só remuxa o bitstream); manter o teto
-          # nesse caso obrigaria a re-encode completo só pra cortar
+          # LEVE: se a fonte já é h264, usar stream copy de VÍDEO sempre —
+          # mesmo que a altura passe do teto (max_encode_height). Stream
+          # copy não consegue reescalar (só remuxa o bitstream); manter o
+          # teto nesse caso obrigaria a re-encode completo só pra cortar
           # resolução, perdendo todo o ganho de velocidade. Trade-off
           # assumido: fontes h264 acima do teto passam a ser servidas na
           # resolução original (maior tamanho de arquivo/banda), em troca
@@ -745,6 +717,18 @@ jobs:
             eff_h      = min(probe['height'], max_h)
             will_scale = probe['height'] > max_h
             eff_w      = round((probe['width'] / probe['height']) * eff_h / 2) * 2 if will_scale else probe['width']
+          # CIRÚRGICO (fix real do loop de bin00000): vídeo e áudio são
+          # codecs INDEPENDENTES — um BluRay rip com vídeo h264 quase
+          # sempre vem com áudio AC3/E-AC3/DTS (comum em releases "DUAL"),
+          # não AAC. O ffmpeg muxa isso no fMP4 sem erro nenhum (não é um
+          # "encode failure"), mas o MSE do navegador rejeita o
+          # appendBuffer() do init+primeiro segmento com esse áudio — o
+          # que produz exatamente o loop no primeiro .bin, sem nunca virar
+          # um erro fatal detectável no ffmpeg. Por isso a decisão de
+          # copiar áudio tem que ser SEPARADA da decisão de vídeo: só
+          # copia se o áudio já for AAC; caso contrário, sempre re-encoda
+          # pra AAC (mesmo com vídeo em stream copy).
+          audio_copy = (audio_codec == 'aac')
           h     = eff_h
           label = ('4k' if h>=2160 else '1440p' if h>=1440 else '1080p' if h>=1080 else '720p' if h>=720 else f'{h}p')
           with open(os.environ['GITHUB_ENV'], 'a') as f:
@@ -752,15 +736,17 @@ jobs:
             f.write(f"PROBE_WIDTH={probe['width']}\n")
             f.write(f"PROBE_HEIGHT={probe['height']}\n")
             f.write(f"PROBE_CODEC={probe['codec']}\n")
+            f.write(f"PROBE_AUDIO_CODEC={audio_codec}\n")
             f.write(f"PROBE_FPS={fps}\n")
             f.write(f"PROBE_BITRATE={probe['bitrate']}\n")
             f.write(f"EFF_HEIGHT={eff_h}\n")
             f.write(f"EFF_WIDTH={eff_w}\n")
             f.write(f"WILL_SCALE={'true' if will_scale else 'false'}\n")
             f.write(f"QUALITY_LABEL={label}\n")
+            f.write(f"AUDIO_COPY={'true' if audio_copy else 'false'}\n")
             f.write(f"STREAM_COPY={'true' if stream_copy else 'false'}\n")
-          print(f"✓ {probe['width']}x{probe['height']} | codec: {src_codec} | {fps:.2f}fps | {probe['duration']:.1f}s")
-          print(f"  → encode {eff_w}x{eff_h} ({label}) | rescale: {will_scale} | stream_copy: {stream_copy}")
+          print(f"✓ {probe['width']}x{probe['height']} | codec: {src_codec} | audio: {audio_codec} | {fps:.2f}fps | {probe['duration']:.1f}s")
+          print(f"  → encode {eff_w}x{eff_h} ({label}) | rescale: {will_scale} | stream_copy(v): {stream_copy} | stream_copy(a): {audio_copy}")
           PYEOF
 
       - name: HLS encode (stream copy se h264 nativo, senão libx264 ultrafast CRF26)
@@ -769,35 +755,41 @@ jobs:
           HLS_DIR="$WORK_DIR/hls"
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
 
-          # CIRÚRGICO: quando STREAM_COPY está ativo, o áudio também é
-          # copiado (-c:a copy), não mais re-encodado pra AAC. O player é
-          # hls.js, que já suporta múltiplas faixas/codecs de áudio — o
-          # re-encode de áudio só existia como precaução, sem necessidade
-          # real. Isso reduz mais um pedaço do tempo de job no caso comum
-          # (fonte já em h264). Só volta a re-encodar áudio no modo de
-          # re-encode completo (fonte não-h264), onde já se paga o custo
-          # de CPU do vídeo mesmo.
+          # CIRÚRGICO (fix do loop de bin00000): vídeo e áudio são decisões
+          # SEPARADAS. STREAM_COPY (vídeo) só olha o codec de vídeo;
+          # AUDIO_COPY (calculado no step "Probe do vídeo") só é true se o
+          # áudio da fonte já for AAC. Um BluRay "DUAL" com vídeo h264 e
+          # áudio AC3/DTS deve copiar o vídeo mas RE-ENCODAR o áudio —
+          # copiar AC3/DTS pro fMP4 faz o MSE do navegador rejeitar o
+          # appendBuffer() do primeiro segmento, sem nenhum erro do lado
+          # do ffmpeg (por isso não caía no fallback de encode-failure).
           #
           # CIRÚRGICO: preset trocado de superfast pra ultrafast no modo
           # de re-encode — prioriza velocidade sobre eficiência de
           # bitrate/qualidade por bitrate. Jobs não podem levar tempo;
           # a perda de qualidade nesse preset é aceita deliberadamente.
           if [ "$STREAM_COPY" = "true" ]; then
-            echo "  → STREAM_COPY ativo (fonte já é h264, sem reescala) — sem re-encode de vídeo NEM áudio"
+            echo "  → Vídeo: STREAM_COPY (fonte já é h264, sem reescala)"
             VCODEC_ARGS="-c:v copy"
-            ACODEC_ARGS="-c:a copy"
           else
-            echo "  → Re-encode completo necessário (codec=${PROBE_CODEC} ou reescala=${WILL_SCALE})"
+            echo "  → Vídeo: re-encode necessário (codec=${PROBE_CODEC} ou reescala=${WILL_SCALE})"
             if [ "$WILL_SCALE" = "true" ]; then
               SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}"
             else
               SCALE_ARGS=""
             fi
             VCODEC_ARGS="$SCALE_ARGS -c:v libx264 -preset ultrafast -crf 26 -tune fastdecode -profile:v high -level 4.0 -pix_fmt yuv420p -g $GOP -keyint_min ${SEG_DURATION}"
+          fi
+
+          if [ "$AUDIO_COPY" = "true" ]; then
+            echo "  → Áudio: STREAM_COPY (fonte já é AAC)"
+            ACODEC_ARGS="-c:a copy"
+          else
+            echo "  → Áudio: re-encode pra AAC necessário (codec fonte=${PROBE_AUDIO_CODEC})"
             ACODEC_ARGS="-c:a aac -b:a 128k -ac 2"
           fi
 
-          echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s) — GOP só se aplica no modo re-encode"
+          echo "  GOP=$GOP frames (${PROBE_FPS}fps × ${SEG_DURATION}s) — GOP só se aplica quando vídeo está em re-encode"
 
           run_encode() {
             ffmpeg -hide_banner -loglevel warning -stats \
@@ -815,8 +807,8 @@ jobs:
           }
 
           if ! run_encode; then
-            if [ "$STREAM_COPY" = "true" ]; then
-              echo "  ⚠ Stream copy falhou (container/codec de áudio incompatível) — fallback pra re-encode completo (vídeo + áudio)"
+            if [ "$STREAM_COPY" = "true" ] || [ "$AUDIO_COPY" = "true" ]; then
+              echo "  ⚠ Encode com stream copy falhou (container incompatível) — fallback pra re-encode completo (vídeo + áudio)"
               rm -f "$HLS_DIR"/*.m4s "$HLS_DIR/init.mp4" "$HLS_DIR/index.m3u8" 2>/dev/null || true
               if [ "$WILL_SCALE" = "true" ]; then
                 SCALE_ARGS="-vf scale=-2:${EFF_HEIGHT}"
@@ -1075,7 +1067,6 @@ jobs:
         env:
           STORAGE_TOKEN: ${{ env.STORAGE_TARGET_TOKEN }}
           STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
-          STORAGE_CREATE_PAT: ${{ secrets.STORAGE_CREATE_PAT }}
         run: |
           python3 << 'PYEOF'
           import os, subprocess, json, time, random
@@ -1127,30 +1118,7 @@ jobs:
             return None, 0
 
           def create_repo(repo):
-            # Installation token de GitHub App não tem permissão pra
-            # criar repos via /user/repos (esse endpoint só aceita
-            # PAT/OAuth de utilizador humano — daí o 403 "Resource not
-            # accessible by integration"; é limitação documentada do
-            # GitHub, não depende de nenhuma permissão que se conceda à
-            # App). Conta de storage é pessoal, não organização, então
-            # /orgs/{org}/repos não se aplica aqui. Única saída sem trocar
-            # de conta: um PAT dedicado, só para esta chamada — o resto
-            # do fluxo (leitura de tamanho, push) continua no token da App.
-            create_pat = os.environ.get('STORAGE_CREATE_PAT', '')
-            if not create_pat:
-              print(f"  ✗ STORAGE_CREATE_PAT não configurado — impossível criar {repo} (installation token de App não cria repos em conta pessoal)")
-              return False
-            cmd = ['curl','-s','-w','\n%{http_code}','-X','POST',
-                   '-H',f'Authorization: Bearer {create_pat}',
-                   '-H','Accept: application/vnd.github+json',
-                   'https://api.github.com/user/repos',
-                   '-d', json.dumps({'name': repo, 'private': False, 'auto_init': True})]
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            out = r.stdout
-            body, _, code_str = out.rpartition('\n') if '\n' in out else ('', '', out)
-            try: cc = int(code_str.strip())
-            except ValueError: cc = 0
-            cout = body
+            cc, cout = api('POST', '/user/repos', {'name': repo, 'private': False, 'auto_init': True})
             if cc == 201:
               return True
             if cc == 422:
@@ -1159,44 +1127,41 @@ jobs:
             print(f"  ✗ Falha ao criar {repo}: HTTP {cc} {cout[:200]}")
             return False
 
-          def scan_prefix(prefix, name_fn, eligible):
-            """Varre repos existentes prefix01, prefix02... até o primeiro
-            404 (fim da sequência). Devolve o próximo número livre dessa
-            sequência (1-based) — usado tanto pra continuar a varredura
-            quanto, na sequência cont_byte, pra saber o próximo nome a
-            criar."""
-            n = 1
-            while n <= MAX_SHARDS_TO_SCAN:
-              repo = name_fn(n)
-              if repo in shard_cache:
-                size_kb = shard_cache[repo]
-              else:
-                existe, size_kb = get_repo_size_kb(repo)
-                if existe is None:
-                  raise SystemExit(1)
-                if not existe:
-                  break
-                shard_cache[repo] = size_kb
-              size_mb = size_kb // 1024
-              print(f"  {repo}: {size_mb}MB")
-              if size_kb < THRESHOLD_KB:
-                eligible.append(repo)
-              n += 1
-            return n
-
           def pick_shard():
             eligible = []
-            # Nomenclatura compiledNN abandonada (repos já transferidos
-            # pra organização separada, fora do escopo deste picker).
-            # Só a sequência cont_byte_N é varrida/criada a partir daqui.
-            next_cont_byte_n = scan_prefix('cont_byte', lambda n: f'cont_byte_{n}', eligible)
+            n = 1
+            while n <= MAX_SHARDS_TO_SCAN:
+              repo = f'compiled{n:02d}'
+
+              if repo in shard_cache:
+                size_kb = shard_cache[repo]
+                exists_here = True
+              else:
+                existe, size_kb = get_repo_size_kb(repo)
+
+                if existe is None:
+                  raise SystemExit(1)
+
+                if not existe:
+                  break
+
+                shard_cache[repo] = size_kb
+                exists_here = True
+
+              size_mb = size_kb // 1024
+              print(f"  {repo}: {size_mb}MB")
+
+              if size_kb < THRESHOLD_KB:
+                eligible.append(repo)
+
+              n += 1
 
             if eligible:
               chosen = random.choice(eligible)
               print(f"  → {len(eligible)} shard(s) elegível(eis): {eligible} — escolhido aleatoriamente: {chosen}")
               return chosen
 
-            new_repo = f'cont_byte_{next_cont_byte_n}'
+            new_repo = f'compiled{n:02d}'
             print(f"  → nenhum shard com espaço livre, a criar {new_repo}...")
             if not create_repo(new_repo):
               raise SystemExit(1)
