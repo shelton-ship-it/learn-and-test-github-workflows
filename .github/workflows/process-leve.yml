@@ -1067,6 +1067,7 @@ jobs:
         env:
           STORAGE_TOKEN: ${{ env.STORAGE_TARGET_TOKEN }}
           STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
+          STORAGE_CREATE_PAT: ${{ secrets.STORAGE_CREATE_PAT }}
         run: |
           python3 << 'PYEOF'
           import os, subprocess, json, time, random
@@ -1118,7 +1119,30 @@ jobs:
             return None, 0
 
           def create_repo(repo):
-            cc, cout = api('POST', '/user/repos', {'name': repo, 'private': False, 'auto_init': True})
+            # Installation token de GitHub App não tem permissão pra
+            # criar repos via /user/repos (esse endpoint só aceita
+            # PAT/OAuth de utilizador humano — daí o 403 "Resource not
+            # accessible by integration"; é limitação documentada do
+            # GitHub, não depende de nenhuma permissão que se conceda à
+            # App). Conta de storage é pessoal, não organização. Única
+            # saída sem trocar de conta: um PAT dedicado, só para esta
+            # chamada — o resto do fluxo (leitura de tamanho, push)
+            # continua no token da App.
+            create_pat = os.environ.get('STORAGE_CREATE_PAT', '')
+            if not create_pat:
+              print(f"  ✗ STORAGE_CREATE_PAT não configurado — impossível criar {repo} (installation token de App não cria repos em conta pessoal)")
+              return False
+            cmd = ['curl','-s','-w','\n%{http_code}','-X','POST',
+                   '-H',f'Authorization: Bearer {create_pat}',
+                   '-H','Accept: application/vnd.github+json',
+                   'https://api.github.com/user/repos',
+                   '-d', json.dumps({'name': repo, 'private': False, 'auto_init': True})]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            out = r.stdout
+            body, _, code_str = out.rpartition('\n') if '\n' in out else ('', '', out)
+            try: cc = int(code_str.strip())
+            except ValueError: cc = 0
+            cout = body
             if cc == 201:
               return True
             if cc == 422:
