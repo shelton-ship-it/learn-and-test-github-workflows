@@ -1216,7 +1216,7 @@ jobs:
           print(f"✓ Branch exclusiva do job: {branch}")
           PYEOF
 
-      - name: Reescrever index.m3u8 com URLs jsDelivr (cdn.pixgo.qzz.io)
+      - name: Reescrever index.m3u8 com URLs jsDelivr
         if: env.COORDINATOR_DISPATCHED != 'true'
         env:
           STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
@@ -1228,7 +1228,7 @@ jobs:
           owner    = os.environ['STORAGE_OWNER']
           shard    = os.environ['SHARD_REPO']
           branch   = os.environ['JOB_BRANCH']
-          raw_base = f"https://cdn.pixgo.qzz.io/gh/{owner}/{shard}@{branch}/{job_id}"
+          raw_base = f"https://cdn.jsdelivr.net/gh/{owner}/{shard}@{branch}/{job_id}"
 
           with open(hls_dir + '/index.m3u8') as f: content = f.read()
 
@@ -1261,7 +1261,7 @@ jobs:
           work_dir  = os.environ['WORK_DIR']
           eff_w     = os.environ['EFF_WIDTH']
           eff_h     = os.environ['EFF_HEIGHT']
-          raw_base  = f"https://cdn.pixgo.qzz.io/gh/{owner}/{shard}@{branch}/{job_id}"
+          raw_base  = f"https://cdn.jsdelivr.net/gh/{owner}/{shard}@{branch}/{job_id}"
           hls_dir   = work_dir + '/hls'
           bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin')
           if bin_files:
@@ -1290,7 +1290,7 @@ jobs:
           owner    = os.environ['STORAGE_OWNER']
           shard    = os.environ['SHARD_REPO']
           branch   = os.environ['JOB_BRANCH']
-          raw_base = f"https://cdn.pixgo.qzz.io/gh/{owner}/{shard}@{branch}/{job_id}"
+          raw_base = f"https://cdn.jsdelivr.net/gh/{owner}/{shard}@{branch}/{job_id}"
 
           nonces = json.load(open(work_dir + '/nonces.json'))
           thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
@@ -1437,7 +1437,7 @@ jobs:
           storage_owner = os.environ['STORAGE_OWNER']
           shard_repo    = os.environ['SHARD_REPO']
           job_branch    = os.environ['JOB_BRANCH']
-          raw_base      = f"https://cdn.pixgo.qzz.io/gh/{storage_owner}/{shard_repo}@{job_branch}/{job_id}"
+          raw_base      = f"https://cdn.jsdelivr.net/gh/{storage_owner}/{shard_repo}@{job_branch}/{job_id}"
 
           try:    metadata = json.loads(os.environ.get('METADATA','{}'))
           except: metadata = {}
