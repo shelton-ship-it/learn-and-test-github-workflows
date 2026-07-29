@@ -45,6 +45,19 @@ name: StreamVault Process (Leve)
 #        transitória de rede é comum e cara de recomeçar do zero.
 #      - get_repo_size_kb (4 tentativas) — lida com rate-limit
 #        secundário real da API do GitHub.
+#
+#   4. FIX CIRÚRGICO (este patch): a condição de "early fail" baseada em
+#      dht_nodes==0 NUNCA disparava na prática — o bootstrap da DHT
+#      povoa dht_nodes (nós conhecidos, não peers do torrent) em poucos
+#      segundos por si só, então a condição "sem peers E sem tracker E
+#      SEM NÓS DHT" deixava de ser verdadeira quase de imediato, mesmo
+#      com 0 peers reais pelo resto do job inteiro. Foi exatamente o que
+#      aconteceu no job registrado que gerou este fix: dht_nodes subiu
+#      de 0 pra 300+ em minutos, peers ficou em 0 a hora inteira, e o
+#      abort cedo nunca disparou — o job só morreu no timeout de 3600s.
+#      Troca: abort baseado SÓ em peers reais, em checks periódicos
+#      (mesmo grid dos logs). Na 2ª verificação seguida com peers==0,
+#      aborta — não espera mais nada de tracker/DHT.
 # ═══════════════════════════════════════════════════════════════════════
 
 on:
@@ -95,7 +108,13 @@ jobs:
     # Conta pessoal — sem Blacksmith. GitHub-hosted runners são
     # ilimitados e gratuitos pra repositório público no plano Free.
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    # CIRÚRGICO: 340 → 45 (ajustado de 30 → 45: job real com download
+    # legítimo levou 22min só no download, deixando pouca folga pra
+    # probe+encode+thumbnails+encriptação+push+registo). Teto duro do
+    # job inteiro — o GitHub Actions cancela sozinho ao atingir esse
+    # tempo, independente de qual step está rodando ou se a lógica de
+    # abort cedo dentro do Python falhou. Última linha de defesa.
+    timeout-minutes: 45
     # actions:write necessário pro coordinator disparar episódios filhos
     # no próprio repo usando o GITHUB_TOKEN automático — workflow_dispatch
     # é uma das exceções documentadas em que o token padrão do Actions
@@ -214,9 +233,18 @@ jobs:
           except Exception as e: print(f"  apply_settings parcial: {e}")
 
           def log_alerts(ses):
-            """Lê e imprime alertas de tracker pendentes. Devolve True se
-            algum tracker respondeu com sucesso (mesmo que com 0 peers)."""
+            """Lê e imprime alertas de tracker pendentes. Devolve
+            (tracker_replied, peer_signal):
+              tracker_replied = algum tracker respondeu, mesmo com 0 peers.
+              peer_signal      = algum tracker CONFIRMOU peers>0 no swarm —
+              sinal real de que existe gente compartilhando. Isso é
+              diferente de handle.status().num_peers>0: conectar a um peer
+              real pode levar minutos mesmo num torrent saudável (visto no
+              job Cold Storage: tracker reportou 134 peers aos 1230s, peers
+              conectados só saiu de 0 depois disso). peer_signal é o sinal
+              cedo e barato; num_peers é o sinal tardio e caro de esperar."""
             tracker_replied = False
+            peer_signal     = False
             for a in ses.pop_alerts():
               name = type(a).__name__
               try:
@@ -227,10 +255,12 @@ jobs:
                 print(f"  ✗ {name}: {msg}")
               elif 'tracker_reply' in name:
                 tracker_replied = True
+                if getattr(a, 'num_peers', 0) > 0:
+                  peer_signal = True
                 print(f"  ✓ {name}: {msg}")
               elif 'tracker_warning' in name:
                 print(f"  ⚠ {name}: {msg}")
-            return tracker_replied
+            return tracker_replied, peer_signal
 
           os.makedirs('/tmp/coord_meta', exist_ok=True)
 
@@ -252,34 +282,44 @@ jobs:
           print("  Aguardando metadados...")
           t0 = time.time()
           tracker_replied = False
-          # CIRÚRGICO: 45s → 2s. Se não há NENHUM sinal (peer, tracker,
-          # nó DHT) já no segundo check, o torrent está morto — esperar
-          # mais não muda esse resultado, só queima tempo de job. Um job
-          # preso aqui não é gratuito: é tempo de runner + tempo até o
-          # próximo item da fila começar. Trade-off assumido: torrents
-          # legítimos mas muito lentos pra responder também são
-          # cancelados — preferível a deixar jobs mortos ocupando fila.
-          EARLY_FAIL_TIMEOUT = 2
+          # CIRÚRGICO (v3 — corrige o v2): v2 abortava na 2ª checagem
+          # seguida com num_peers==0, mas conectar a um peer real pode
+          # levar minutos mesmo num torrent saudável (tracker confirma o
+          # swarm em segundos; libtorrent só conecta depois) — isso
+          # abortaria torrents legítimos. Critério novo: só conta
+          # "verificação vazia" se, além de peers==0, NENHUM tracker
+          # jamais confirmou peers>0 no swarm (peer_signal). Assim que um
+          # tracker confirma swarm vivo, o contador para de contar pra
+          # sempre — mesmo que a conexão real demore.
+          CHECK_INTERVAL    = 15
+          zero_peer_checks  = 0
+          peer_signal_seen  = False
+          last_check_t      = -1
 
           METADATA_TIMEOUT = 900
           while not handle.status().has_metadata:
-            if log_alerts(ses):
-              tracker_replied = True
+            replied, signal = log_alerts(ses)
+            if replied: tracker_replied   = True
+            if signal:  peer_signal_seen  = True
             elapsed = int(time.time() - t0)
             st = handle.status()
             dht_nodes = ses.status().dht_nodes if hasattr(ses.status(), 'dht_nodes') else 0
-            if (elapsed > EARLY_FAIL_TIMEOUT and st.num_peers == 0
-                and not tracker_replied and dht_nodes == 0):
-              print(f"ERRO: {EARLY_FAIL_TIMEOUT}s sem peers, sem resposta de tracker e sem nós DHT — torrent sem seeders/trackers vivos. A abortar cedo (não esperar até {METADATA_TIMEOUT}s).")
-              ses.remove_torrent(handle)
-              sys.exit(1)
+            if elapsed != last_check_t and elapsed % CHECK_INTERVAL == 0:
+              last_check_t = elapsed
+              print(f"  ... {elapsed}s | peers: {st.num_peers} | dht_nodes: {dht_nodes} | tracker_ok: {tracker_replied} | peer_signal: {peer_signal_seen}")
+              if st.num_peers == 0 and not peer_signal_seen:
+                zero_peer_checks += 1
+                if zero_peer_checks >= 2:
+                  print(f"ERRO: {zero_peer_checks}ª verificação seguida (a cada {CHECK_INTERVAL}s) sem peers e sem nenhum tracker confirmando swarm vivo — torrent sem seeders. A abortar cedo (não esperar até {METADATA_TIMEOUT}s).")
+                  ses.remove_torrent(handle)
+                  sys.exit(1)
+              else:
+                zero_peer_checks = 0
             if elapsed > METADATA_TIMEOUT:
               print(f"ERRO: timeout metadados ({METADATA_TIMEOUT}s)")
               ses.remove_torrent(handle)
               sys.exit(1)
             ses.wait_for_alert(1000)
-            if elapsed % 15 == 0 and elapsed > 0:
-              print(f"  ... {elapsed}s | peers: {st.num_peers} | dht_nodes: {dht_nodes} | tracker_ok: {tracker_replied}")
 
           info = handle.get_torrent_info()
           fs   = info.files()
@@ -474,9 +514,19 @@ jobs:
           except Exception as e: print(f"⚠ apply_settings parcial: {e}")
 
           def log_alerts(ses):
-            """Lê e imprime alertas de tracker/DHT pendentes. Devolve True se
-            algum tracker respondeu com sucesso (mesmo que com 0 peers)."""
+            """Lê e imprime alertas de tracker/DHT pendentes. Devolve
+            (tracker_replied, peer_signal):
+              tracker_replied = algum tracker respondeu, mesmo com 0 peers.
+              peer_signal      = algum tracker CONFIRMOU peers>0 no swarm —
+              sinal real de que existe gente compartilhando. Diferente de
+              handle.status().num_peers>0: conectar a um peer real pode
+              levar minutos mesmo num torrent saudável (visto no job Cold
+              Storage real: tracker reportou 134 peers aos 1230s, peers
+              conectados só saiu de 0 depois disso, e o download completou
+              normalmente aos 1319s). peer_signal é o sinal cedo e barato;
+              num_peers é o sinal tardio e caro de esperar."""
             tracker_replied = False
+            peer_signal     = False
             for a in ses.pop_alerts():
               name = type(a).__name__
               try:
@@ -487,12 +537,14 @@ jobs:
                 print(f"  ✗ {name}: {msg}")
               elif 'tracker_reply' in name:
                 tracker_replied = True
+                if getattr(a, 'num_peers', 0) > 0:
+                  peer_signal = True
                 print(f"  ✓ {name}: {msg}")
               elif 'tracker_warning' in name:
                 print(f"  ⚠ {name}: {msg}")
               elif 'tracker_announce' in name:
                 print(f"  → {name}: {msg}")
-            return tracker_replied
+            return tracker_replied, peer_signal
 
           params = lt.add_torrent_params()
           params.save_path = dest_dir
@@ -538,23 +590,47 @@ jobs:
           start_t        = time.time()
           stall_t        = time.time()
           stall_bytes    = 0
-          tracker_replied = False
-          # CIRÚRGICO: mesmo raciocínio do coordinator — 2s, não 45s.
-          EARLY_FAIL_TIMEOUT = 2
+          tracker_replied  = False
+          # CIRÚRGICO (v3 — corrige o v2): v2 abortava na 2ª checagem
+          # seguida com num_peers==0, e isso quase matou um download
+          # LEGÍTIMO em produção — job real (Cold Storage): tracker
+          # confirmou 134 peers no swarm aos 1230s, mas o libtorrent só
+          # conectou de fato depois disso (peers conectados ficou em 0
+          # por 41 checagens seguidas de 30s antes de subir) — e o
+          # download completou normalmente aos 1319s. Conectar é lento
+          # mesmo em torrent saudável; a resposta do tracker é que é
+          # rápida e confiável (chegou aos ~28s nesse job).
+          # Critério novo: só conta "verificação vazia" se, além de
+          # peers==0, NENHUM tracker jamais confirmou peers>0 no swarm
+          # (peer_signal_seen). Assim que um tracker confirma swarm
+          # vivo, o contador para de contar pra sempre — mesmo que a
+          # conexão real demore minutos, como no Cold Storage.
+          CHECK_INTERVAL    = 30
+          zero_peer_checks  = 0
+          peer_signal_seen  = False
 
           while True:
-            s   = handle.status()
-            if log_alerts(ses):
-              tracker_replied = True
+            s = handle.status()
+            replied, signal = log_alerts(ses)
+            if replied: tracker_replied  = True
+            if signal:  peer_signal_seen = True
             pct     = int(s.progress * 100)
             elapsed = int(time.time() - start_t)
-            if pct != last_pct or elapsed - last_log_t >= 30:
+            is_check_point = (pct != last_pct or elapsed - last_log_t >= CHECK_INTERVAL)
+            if is_check_point:
               dl_kb     = s.download_rate // 1024
               peers     = s.num_peers
               dht_nodes = ses.status().dht_nodes if hasattr(ses.status(), 'dht_nodes') else '?'
-              print(f"  [{elapsed:4d}s] {pct:3d}% | {dl_kb:6d} KB/s | peers: {peers} | dht_nodes: {dht_nodes} | tracker_ok: {tracker_replied}")
+              print(f"  [{elapsed:4d}s] {pct:3d}% | {dl_kb:6d} KB/s | peers: {peers} | dht_nodes: {dht_nodes} | tracker_ok: {tracker_replied} | peer_signal: {peer_signal_seen}")
               last_pct   = pct
               last_log_t = elapsed
+              if peers == 0 and not peer_signal_seen:
+                zero_peer_checks += 1
+                if zero_peer_checks >= 2:
+                  print(f"✗ {zero_peer_checks}ª verificação seguida (a cada {CHECK_INTERVAL}s) sem peers e sem nenhum tracker confirmando swarm vivo ({elapsed}s) — torrent sem seeders. A abortar (não esperar até {MAX_WAIT}s).")
+                  sys.exit(1)
+              else:
+                zero_peer_checks = 0
             current_bytes = int(s.progress * (s.total_wanted or 1))
             if current_bytes > stall_bytes:
               stall_bytes = current_bytes
@@ -565,11 +641,6 @@ jobs:
             if s.is_seeding or s.progress >= 1.0:
               print(f"✓ Download completo ({int(time.time()-start_t)}s)")
               break
-            if (elapsed > EARLY_FAIL_TIMEOUT and s.num_peers == 0
-                and not tracker_replied
-                and (not hasattr(ses.status(), 'dht_nodes') or ses.status().dht_nodes == 0)):
-              print(f"✗ {EARLY_FAIL_TIMEOUT}s sem peers, sem resposta de tracker e sem nós DHT — torrent sem seeders/trackers vivos. A abortar cedo (não esperar até {MAX_WAIT}s).")
-              sys.exit(1)
             if (time.time() - start_t) > MAX_WAIT:
               print(f'⚠ Timeout após {MAX_WAIT}s — progresso: {pct}%')
               if pct == 0: sys.exit(1)
