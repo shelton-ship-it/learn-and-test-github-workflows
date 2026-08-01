@@ -41,23 +41,57 @@ name: StreamVault Process (Leve)
 #   RETRIES MANTIDOS SEM ALTERAÇÃO (propositalmente):
 #      - Registo no EdgeOne (5 tentativas) — ambiente serverless pode
 #        estar em sleep.
-#      - Git push do shard (8 tentativas) — única operação onde falha
-#        transitória de rede é comum e cara de recomeçar do zero.
+#      - Git push do shard (8 tentativas por lote, dentro de UM shard)
+#        — única operação onde falha transitória de rede é comum e cara
+#        de recomeçar do zero.
 #      - get_repo_size_kb (4 tentativas) — lida com rate-limit
 #        secundário real da API do GitHub.
 #
-#   4. FIX CIRÚRGICO (este patch): a condição de "early fail" baseada em
-#      dht_nodes==0 NUNCA disparava na prática — o bootstrap da DHT
-#      povoa dht_nodes (nós conhecidos, não peers do torrent) em poucos
-#      segundos por si só, então a condição "sem peers E sem tracker E
-#      SEM NÓS DHT" deixava de ser verdadeira quase de imediato, mesmo
-#      com 0 peers reais pelo resto do job inteiro. Foi exatamente o que
-#      aconteceu no job registrado que gerou este fix: dht_nodes subiu
-#      de 0 pra 300+ em minutos, peers ficou em 0 a hora inteira, e o
-#      abort cedo nunca disparou — o job só morreu no timeout de 3600s.
-#      Troca: abort baseado SÓ em peers reais, em checks periódicos
-#      (mesmo grid dos logs). Na 2ª verificação seguida com peers==0,
-#      aborta — não espera mais nada de tracker/DHT.
+#   4. FIX CIRÚRGICO (patch anterior): a condição de "early fail" baseada
+#      em dht_nodes==0 nunca disparava na prática — removida, abort
+#      cedo agora é só o timeout-minutes: 45 do job inteiro.
+#
+#   5. FIX CIRÚRGICO (este patch — shard cheio):
+#      "Repository is above its size quota" é um erro PERMANENTE do
+#      pre-receive hook do GitHub, não transitório. O retry antigo
+#      tratava esse erro do mesmo jeito que uma falha de rede — 8
+#      tentativas com backoff até ~70s cada, sempre contra o MESMO
+#      shard, sempre fadadas a falhar do mesmo jeito. A causa raiz é
+#      que o campo `size` da API do GitHub (usado por pick_shard() pra
+#      decidir se um shard tem espaço) pode estar desatualizado na hora
+#      da escolha — GitHub atualiza esse valor com atraso, especialmente
+#      sob push concorrente de vários jobs pro mesmo shard. Ou seja: um
+#      shard pode passar no filtro de 3.5GB e mesmo assim já estar cheio
+#      no servidor no momento do push real.
+#      Fix: os steps "Escolher shard", "Reescrever URLs" e "Commit+push"
+#      foram fundidos num único step com loop de fallback. Se o push
+#      falhar com erro de quota, o shard é marcado como cheio nesta run
+#      e o job escolhe automaticamente outro shard (ou cria um novo),
+#      regenera as URLs (index.m3u8/master.m3u8/cdn_urls.json) pro novo
+#      shard, e tenta de novo — até 5 shards diferentes antes de desistir.
+#      Falhas de rede genuínas (não-quota) continuam com os mesmos 8
+#      retries por lote de antes, dentro do shard atual.
+#
+#   6. FIX CIRÚRGICO (este patch — numeração/catálogo de episódios):
+#      Quando os episódios de uma série chegam como links separados
+#      (um torrent por episódio, ex.: link A = ep1, link B = ep2), CADA
+#      chamada ao coordinator processa um torrent com 1 único ficheiro
+#      de vídeo. Antes, o coordinator IGNORAVA completamente o input
+#      `episode_number` fornecido pelo chamador e tentava adivinhar o
+#      número via regex no nome do ficheiro — e quando o nome não tinha
+#      um padrão reconhecível (comum em releases sem SxxExx no filename),
+#      caía no fallback `counter = 1`, sempre reiniciando do zero a cada
+#      chamada isolada (é exatamente o "reseta como 1 ep" relatado).
+#      Fix: quando o torrent tem exatamente 1 ficheiro de vídeo E o
+#      chamador forneceu `episode_number` explícito (não vazio, != '0'),
+#      esse valor tem prioridade absoluta sobre qualquer tentativa de
+#      adivinhar pelo nome do ficheiro. A detecção por regex/fallback
+#      continua a existir só para o caso real de batch multi-episódio
+#      num único torrent, onde não há como o chamador saber os números
+#      de antemão. Também foi adicionado um aviso explícito quando
+#      `metadata.contentId` vem vazio — causa mais provável de episódios
+#      da mesma série virarem entradas separadas no catálogo, porque cada
+#      job cai de volta pro próprio job_id (único por definição) como ID.
 # ═══════════════════════════════════════════════════════════════════════
 
 on:
@@ -196,6 +230,8 @@ jobs:
           INPUT_SEG:         ${{ inputs.seg_duration }}
           INPUT_HEIGHT:      ${{ inputs.max_encode_height }}
           INPUT_SEASON:      ${{ inputs.season_number }}
+          INPUT_EPISODE:     ${{ inputs.episode_number }}
+          INPUT_EP_TITLE:    ${{ inputs.episode_title }}
           # workflow_dispatch é uma exceção documentada — o GITHUB_TOKEN
           # automático PODE disparar outro workflow_dispatch no mesmo
           # repo (diferente de eventos como push, que não disparam, pra
@@ -211,12 +247,26 @@ jobs:
           url          = os.environ['INPUT_VIDEO_URL']
           metadata_raw = os.environ['INPUT_METADATA']
           season_num   = int(os.environ.get('INPUT_SEASON', '0') or '0')
+          # FIX (numeração/catálogo): episódio e título explícitos vindos
+          # do chamador — antes eram completamente ignorados pelo
+          # coordinator, que sempre recalculava o número via regex no
+          # nome do ficheiro, mesmo quando o chamador já sabia o número
+          # certo (caso comum: um torrent por episódio, submetido um de
+          # cada vez). '0' e vazio contam como "não informado".
+          input_episode_raw = (os.environ.get('INPUT_EPISODE', '') or '').strip()
+          input_episode      = int(input_episode_raw) if input_episode_raw.isdigit() and input_episode_raw != '0' else None
+          input_ep_title      = os.environ.get('INPUT_EP_TITLE', '') or ''
           VIDEO_EXTS   = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
           BATCH_LIMIT  = 1_400 * 1024 * 1024
 
           try:    metadata = json.loads(metadata_raw)
           except: metadata = {}
           content_id = metadata.get('contentId') or ''
+          if not content_id:
+            print("  ⚠ metadata.contentId vazio — o ID será derivado do título. Se o título "
+                  "variar minimamente entre submissões do MESMO conteúdo (espaços, maiúsculas, "
+                  "pontuação), cada submissão vira uma entrada DIFERENTE no catálogo. Prefira "
+                  "sempre passar contentId explícito ao juntar episódios da mesma série/filme.")
 
           print(f"Coordinator: {metadata.get('title','?')} S{season_num:02d} | {url[:70]}...")
 
@@ -339,20 +389,30 @@ jobs:
               if m: return int(m.group(1))
             return None
 
-          for vf in video_files:
-            vf['ep_num'] = extract_ep(vf['name'])
+          # FIX (numeração/catálogo): caso mais comum de "link isolado por
+          # episódio" — torrent com 1 único ficheiro de vídeo. Se o
+          # chamador já informou episode_number explicitamente, usa esse
+          # valor direto, sem NENHUMA tentativa de adivinhar pelo nome —
+          # elimina tanto o "reseta pra ep1" (fallback de counter) quanto
+          # o "vira ep4-alguma-coisa" (regex pegando um número errado de
+          # dentro do nome do ficheiro, tipo resolução ou ano).
+          if len(video_files) == 1 and input_episode is not None:
+            video_files[0]['ep_num'] = input_episode
+            print(f"  Episódio único com episode_number explícito: usando ep{input_episode:02d} "
+                  f"(ignorando qualquer padrão no nome do ficheiro)")
+          else:
+            for vf in video_files:
+              vf['ep_num'] = extract_ep(vf['name'])
 
-          video_files.sort(key=lambda x: (x['ep_num'] is None, x['ep_num'] or 0, x['name']))
-
-          used_nums = {v['ep_num'] for v in video_files if v['ep_num'] is not None}
-          counter   = 1
-          for vf in video_files:
-            if vf['ep_num'] is None:
-              while counter in used_nums:
+            used_nums = {v['ep_num'] for v in video_files if v['ep_num'] is not None}
+            counter   = 1
+            for vf in video_files:
+              if vf['ep_num'] is None:
+                while counter in used_nums:
+                  counter += 1
+                vf['ep_num'] = counter
+                used_nums.add(counter)
                 counter += 1
-              vf['ep_num'] = counter
-              used_nums.add(counter)
-              counter += 1
 
           for vf in video_files:
             print(f"  [{vf['index']:2d}] ep{vf['ep_num']:02d} | {vf['name']} | {vf['size']//(1024*1024)}MB")
@@ -394,7 +454,10 @@ jobs:
               'metadata':          json.dumps(child_meta),
               'season_number':     str(season_num),
               'episode_number':    ep_numbers,
-              'episode_title':     '',
+              # FIX: propaga o episode_title explícito quando o batch é
+              # de fato 1 único episódio (batch multi-episódio não tem
+              # como usar um título único, mantém vazio como antes).
+              'episode_title':     input_ep_title if len(batch) == 1 else '',
               'file_indices':      indices_str,
             })
 
@@ -1106,34 +1169,83 @@ jobs:
           PYEOF
 
       # ═══════════════════════════════════════════════════════════════════
-      # GIT-SHARD — inalterado na lógica interna (retries de git/rate-limit
-      # mantidos); STORAGE_TARGET_TOKEN/OWNER vêm do step acima
+      # GIT-SHARD — FUNDIDO (fix cirúrgico #5): escolha de shard, geração
+      # de URLs (index.m3u8/master.m3u8/cdn_urls.json) e push agora vivem
+      # num único step com loop de fallback. Se o push falhar por quota
+      # cheia, troca de shard automaticamente e regenera as URLs pro
+      # shard novo — em vez de repetir 8x contra um shard que nunca vai
+      # aceitar o push. STORAGE_TARGET_TOKEN/OWNER vêm do step acima.
       # ═══════════════════════════════════════════════════════════════════
 
-      - name: Escolher shard de storage
+      - name: Definir branch exclusiva do job
+        if: env.COORDINATOR_DISPATCHED != 'true'
+        run: |
+          python3 << 'PYEOF'
+          import os, re
+          job_id = os.environ['JOB_ID']
+          safe = re.sub(r'[^A-Za-z0-9._-]', '-', job_id)
+          safe = re.sub(r'\.{2,}', '.', safe).strip('.-')
+          if not safe:
+            safe = 'job'
+          branch = f"job-{safe}"
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f"JOB_BRANCH={branch}\n")
+          print(f"✓ Branch exclusiva do job: {branch}")
+          PYEOF
+
+      - name: Escolher shard, gerar URLs e enviar (com fallback automático de shard cheio)
         if: env.COORDINATOR_DISPATCHED != 'true'
         env:
           STORAGE_TOKEN: ${{ env.STORAGE_TARGET_TOKEN }}
           STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
           STORAGE_CREATE_PAT: ${{ secrets.STORAGE_CREATE_PAT }}
         run: |
-          python3 << 'PYEOF'
-          import os, subprocess, json, time, random
+          git config --global core.deltaBaseCacheLimit 2047m
+          git config --global core.looseObjects 0
+          git config --global pack.compression 0
+          git config --global pack.window 0
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+          git config --global repack.useDeltaBaseOffset true
+          git config --global advice.detachedHead false
 
-          THRESHOLD_KB = 3_500 * 1024
+          python3 << 'PYEOF'
+          import os, subprocess, json, time, random, re, shutil
+
+          THRESHOLD_KB       = 3_500 * 1024
           MAX_SHARDS_TO_SCAN = 20
-          owner = os.environ['STORAGE_OWNER']
-          token = os.environ['STORAGE_TOKEN']
-          shard_cache = {}
+          # FIX (shard cheio): antes só tentava UM shard e, se o push
+          # falhasse, o job inteiro morria depois de 8 tentativas inúteis.
+          # Agora tenta até 5 shards diferentes antes de desistir de vez.
+          MAX_SHARD_ATTEMPTS = 5
+          BATCH_SIZE         = 400
+
+          owner      = os.environ['STORAGE_OWNER']
+          token      = os.environ['STORAGE_TOKEN']
+          work_dir   = os.environ['WORK_DIR']
+          job_id     = os.environ['JOB_ID']
+          job_branch = os.environ['JOB_BRANCH']
+          eff_w      = os.environ['EFF_WIDTH']
+          eff_h      = os.environ['EFF_HEIGHT']
+          seg_duration = int(os.environ['SEG_DURATION'])
+
+          hls_dir    = work_dir + '/hls'
+          orig_index = hls_dir + '/index.m3u8.orig'
+          # Guarda uma cópia intocada do index.m3u8 (com paths relativos,
+          # antes de qualquer reescrita de URL) — necessário porque, se
+          # trocarmos de shard no meio do caminho, a reescrita de URLs
+          # precisa partir sempre do original, nunca de uma versão já
+          # reescrita pro shard anterior (senão os regex de substituição
+          # não casam mais nada, já que "init.mp4"/"segNNNNN.m4s" já
+          # foram trocados por URLs completas na tentativa anterior).
+          shutil.copy(hls_dir + '/index.m3u8', orig_index)
 
           def api(method, path, data=None):
             # -L: segue redirects (301/302). Sem isso, um repo renomeado/
             # transferido ou um mismatch de maiúsculas no owner devolve
-            # 301 cru — que o código corretamente não trata como "não
-            # existe" (ver FIX #4 acima), mas também nunca resolve,
-            # ficando preso em retry até esgotar tentativas e abortar.
-            # Com -L, o curl segue o redirect e devolve o status FINAL
-            # (200 se o repo existe no destino, 404 se não existe mais).
+            # 301 cru — o código não trata isso como "não existe", mas
+            # também nunca resolve, ficando preso em retry até abortar.
             cmd = ['curl','-s','-L','-w','\n%{http_code}','-X',method,
                    '-H',f'Authorization: Bearer {token}',
                    '-H','Accept: application/vnd.github+json',
@@ -1190,276 +1302,176 @@ jobs:
             body, _, code_str = out.rpartition('\n') if '\n' in out else ('', '', out)
             try: cc = int(code_str.strip())
             except ValueError: cc = 0
-            cout = body
             if cc == 201:
               return True
             if cc == 422:
               print(f"  ⚠ {repo} já existe (criado concorrentemente por outro job) — reutilizando")
               return True
-            print(f"  ✗ Falha ao criar {repo}: HTTP {cc} {cout[:200]}")
+            print(f"  ✗ Falha ao criar {repo}: HTTP {cc} {body[:200]}")
             return False
 
-          def pick_shard():
+          def pick_shard(exclude):
+            # FIX (shard cheio): sempre reconsulta o tamanho na hora,
+            # sem cache entre tentativas — é justamente um valor
+            # obsoleto de `size` que causou escolher um shard já cheio
+            # da primeira vez. `exclude` traz os shards já rejeitados
+            # por erro de quota NESTA run.
             eligible = []
             n = 1
             while n <= MAX_SHARDS_TO_SCAN:
               repo = f'compiled{n:02d}'
-
-              if repo in shard_cache:
-                size_kb = shard_cache[repo]
-                exists_here = True
-              else:
-                existe, size_kb = get_repo_size_kb(repo)
-
-                if existe is None:
-                  raise SystemExit(1)
-
-                if not existe:
-                  break
-
-                shard_cache[repo] = size_kb
-                exists_here = True
-
+              if repo in exclude:
+                n += 1
+                continue
+              existe, size_kb = get_repo_size_kb(repo)
+              if existe is None:
+                raise SystemExit(1)
+              if not existe:
+                break
               size_mb = size_kb // 1024
               print(f"  {repo}: {size_mb}MB")
-
               if size_kb < THRESHOLD_KB:
                 eligible.append(repo)
-
               n += 1
-
             if eligible:
               chosen = random.choice(eligible)
               print(f"  → {len(eligible)} shard(s) elegível(eis): {eligible} — escolhido aleatoriamente: {chosen}")
               return chosen
-
             new_repo = f'compiled{n:02d}'
             print(f"  → nenhum shard com espaço livre, a criar {new_repo}...")
             if not create_repo(new_repo):
               raise SystemExit(1)
-            existe2, size_kb2 = get_repo_size_kb(new_repo)
-            shard_cache[new_repo] = size_kb2 if existe2 else 0
             return new_repo
 
-          shard = pick_shard()
-          print(f"✓ Shard escolhido: {shard}")
+          def rewrite_urls(shard):
+            raw_base = f"https://cdn.jsdelivr.net/gh/{owner}/{shard}@{job_branch}/{job_id}"
+            with open(orig_index) as f:
+              content = f.read()
+            content = re.sub(r'#EXT-X-MAP:URI="init\.mp4"',
+                              f'#EXT-X-MAP:URI="{raw_base}/hls/init.bin"', content)
+            content = re.sub(r'^(seg\d+)\.m4s$',
+                              lambda m: f"{raw_base}/hls/{m.group(1)}.bin",
+                              content, flags=re.MULTILINE)
+            with open(hls_dir + '/index.m3u8', 'w') as f:
+              f.write(content)
+
+            bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin')
+            if bin_files:
+              total_bytes  = sum(os.path.getsize(os.path.join(hls_dir, f)) for f in bin_files)
+              duration_s   = len(bin_files) * seg_duration
+              real_bitrate = int((total_bytes * 8) / duration_s) if duration_s > 0 else 2000000
+            else:
+              real_bitrate = int(os.environ.get('PROBE_BITRATE') or 2000000)
+            master = '\n'.join(['#EXTM3U', '#EXT-X-VERSION:6', '',
+              f'#EXT-X-STREAM-INF:BANDWIDTH={real_bitrate},RESOLUTION={eff_w}x{eff_h}',
+              f'{raw_base}/hls/index.m3u8'])
+            with open(work_dir + '/master.m3u8', 'w') as f:
+              f.write(master)
+
+            nonces = json.load(open(work_dir + '/nonces.json'))
+            thumbs_path = work_dir + '/thumbs_manifest.json'
+            thumbs = json.load(open(thumbs_path)) if os.path.exists(thumbs_path) else []
+            cdn_urls = [f"{raw_base}/master.m3u8", f"{raw_base}/nonces.json",
+                        f"{raw_base}/hls/index.m3u8", f"{raw_base}/hls/init.bin"]
+            seg_names = sorted(bn for bn in nonces['nonces'] if bn != 'init.bin')
+            cdn_urls += [f"{raw_base}/hls/{bn}" for bn in seg_names]
+            cdn_urls += [f"{raw_base}/thumbs/{os.path.basename(t['path'])}" for t in thumbs]
+            json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
+            print(f"✓ URLs geradas pro shard {shard}: master.m3u8 | nonces.json | {len(cdn_urls)} entradas em cdn_urls.json")
+
+          # Marcadores de erro PERMANENTE — nunca resolvem com retry
+          # contra o mesmo shard, só trocando de shard.
+          QUOTA_MARKERS = ('size quota', 'pre-receive hook declined', 'repository is above')
+
+          def push_batch(batch_num, total_batches, max_attempts=8):
+            """'ok' | 'quota' | 'fail'. Só repete em cima do que parece
+            transitório (rede/RPC) — erro de quota sai de imediato, sem
+            queimar as 8 tentativas à toa."""
+            for attempt in range(1, max_attempts + 1):
+              print(f"→ Lote {batch_num}/{total_batches} — push tentativa {attempt}/{max_attempts}...")
+              r = subprocess.run(['git', 'push', '-q', '--force', 'origin', job_branch],
+                                  capture_output=True, text=True)
+              out = (r.stdout + r.stderr)
+              if r.returncode == 0:
+                print(f"✓ Lote {batch_num}/{total_batches} enviado (tentativa {attempt})")
+                return 'ok'
+              if any(m in out.lower() for m in QUOTA_MARKERS):
+                print(f"✗ Shard cheio (quota) — erro permanente, não adianta retry: {out.strip()[:300]}")
+                return 'quota'
+              wait = attempt * 8 + random.randint(0, 10)
+              print(f"  ⚠ Push do lote {batch_num} falhou (rede/RPC transitório — branch exclusiva, sem colisão possível) — retry em {wait}s...")
+              print(f"  {out.strip()[:300]}")
+              time.sleep(wait)
+            print(f"✗ Lote {batch_num}/{total_batches} falhou após {max_attempts} tentativas (não relacionado a quota)")
+            return 'fail'
+
+          def push_all_batches(shard):
+            repo_url = f"https://x-access-token:{token}@github.com/{owner}/{shard}.git"
+            shutil.rmtree('/tmp/shard', ignore_errors=True)
+            os.makedirs('/tmp/shard')
+            os.chdir('/tmp/shard')
+            subprocess.run(['git', 'init', '-q'], check=True)
+            subprocess.run(['git', 'checkout', '-q', '-b', job_branch], check=True)
+            subprocess.run(['git', 'remote', 'add', 'origin', repo_url], check=True)
+            os.makedirs(f'{job_id}/hls', exist_ok=True)
+            os.makedirs(f'{job_id}/thumbs', exist_ok=True)
+
+            files = sorted(os.path.join('hls', f) for f in os.listdir(hls_dir))
+            files += ['master.m3u8', 'nonces.json']
+            thumbs_dir = work_dir + '/thumbs'
+            if os.path.isdir(thumbs_dir) and os.listdir(thumbs_dir):
+              files += sorted(os.path.join('thumbs', f) for f in os.listdir(thumbs_dir))
+
+            total = len(files)
+            num_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+            print(f"→ {total} ficheiro(s) a enviar em {num_batches} lote(s) de até {BATCH_SIZE} na branch {job_branch} (shard {shard})")
+
+            for bi in range(num_batches):
+              batch = files[bi*BATCH_SIZE:(bi+1)*BATCH_SIZE]
+              for rel in batch:
+                os.makedirs(os.path.dirname(f'{job_id}/{rel}') or '.', exist_ok=True)
+                shutil.copy(f'{work_dir}/{rel}', f'{job_id}/{rel}')
+              subprocess.run(['git', '-c', 'user.name=sv-bot', '-c', 'user.email=sv-bot@pixgo.frii.site',
+                               'add', job_id], check=True)
+              subprocess.run(['git', '-c', 'user.name=sv-bot', '-c', 'user.email=sv-bot@pixgo.frii.site',
+                               'commit', '-m', f'job={job_id} lote={bi+1}/{num_batches}', '-q'])
+              result = push_batch(bi+1, num_batches)
+              if result != 'ok':
+                os.chdir('/')
+                shutil.rmtree('/tmp/shard', ignore_errors=True)
+                return result
+
+            os.chdir('/')
+            shutil.rmtree('/tmp/shard', ignore_errors=True)
+            print(f"✓ Todos os {num_batches} lote(s) enviados para {shard}@{job_branch}: {job_id}")
+            return 'ok'
+
+          exclude = set()
+          final_shard = None
+          for shard_attempt in range(1, MAX_SHARD_ATTEMPTS + 1):
+            print(f"════ Shard — tentativa {shard_attempt}/{MAX_SHARD_ATTEMPTS} (excluindo: {sorted(exclude) or '-'}) ════")
+            shard = pick_shard(exclude)
+            print(f"✓ Shard escolhido: {shard}")
+            rewrite_urls(shard)
+            result = push_all_batches(shard)
+            if result == 'ok':
+              final_shard = shard
+              break
+            elif result == 'quota':
+              print(f"  → marcando {shard} como cheio nesta run e tentando outro shard...")
+              exclude.add(shard)
+            else:
+              print(f"✗ Falha não relacionada a quota no shard {shard} — trocar de shard não resolveria, abortando job")
+              raise SystemExit(1)
+
+          if not final_shard:
+            print(f"✗ Todos os {MAX_SHARD_ATTEMPTS} shards tentados estavam cheios ou indisponíveis — job falhou")
+            raise SystemExit(1)
 
           with open(os.environ['GITHUB_ENV'], 'a') as f:
-            f.write(f"SHARD_REPO={shard}\n")
+            f.write(f"SHARD_REPO={final_shard}\n")
+          print(f"✓ Envio concluído — shard definitivo: {final_shard}")
           PYEOF
-
-      - name: Definir branch exclusiva do job
-        if: env.COORDINATOR_DISPATCHED != 'true'
-        run: |
-          python3 << 'PYEOF'
-          import os, re
-          job_id = os.environ['JOB_ID']
-          safe = re.sub(r'[^A-Za-z0-9._-]', '-', job_id)
-          safe = re.sub(r'\.{2,}', '.', safe).strip('.-')
-          if not safe:
-            safe = 'job'
-          branch = f"job-{safe}"
-          with open(os.environ['GITHUB_ENV'], 'a') as f:
-            f.write(f"JOB_BRANCH={branch}\n")
-          print(f"✓ Branch exclusiva do job: {branch}")
-          PYEOF
-
-      - name: Reescrever index.m3u8 com URLs jsDelivr
-        if: env.COORDINATOR_DISPATCHED != 'true'
-        env:
-          STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
-        run: |
-          python3 << 'PYEOF'
-          import re, os
-          hls_dir  = os.environ['WORK_DIR'] + '/hls'
-          job_id   = os.environ['JOB_ID']
-          owner    = os.environ['STORAGE_OWNER']
-          shard    = os.environ['SHARD_REPO']
-          branch   = os.environ['JOB_BRANCH']
-          raw_base = f"https://cdn.jsdelivr.net/gh/{owner}/{shard}@{branch}/{job_id}"
-
-          with open(hls_dir + '/index.m3u8') as f: content = f.read()
-
-          content = re.sub(
-            r'#EXT-X-MAP:URI="init\.mp4"',
-            f'#EXT-X-MAP:URI="{raw_base}/hls/init.bin"',
-            content
-          )
-          content = re.sub(
-            r'^(seg\d+)\.m4s$',
-            lambda m: f"{raw_base}/hls/{m.group(1)}.bin",
-            content, flags=re.MULTILINE
-          )
-
-          with open(hls_dir + '/index.m3u8', 'w') as f: f.write(content)
-          print(f"✓ index.m3u8 reescrito → {raw_base}/hls/")
-          PYEOF
-
-      - name: Gerar master.m3u8
-        if: env.COORDINATOR_DISPATCHED != 'true'
-        env:
-          STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
-        run: |
-          python3 << 'PYEOF'
-          import os
-          job_id    = os.environ['JOB_ID']
-          owner     = os.environ['STORAGE_OWNER']
-          shard     = os.environ['SHARD_REPO']
-          branch    = os.environ['JOB_BRANCH']
-          work_dir  = os.environ['WORK_DIR']
-          eff_w     = os.environ['EFF_WIDTH']
-          eff_h     = os.environ['EFF_HEIGHT']
-          raw_base  = f"https://cdn.jsdelivr.net/gh/{owner}/{shard}@{branch}/{job_id}"
-          hls_dir   = work_dir + '/hls'
-          bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin')
-          if bin_files:
-            total_bytes  = sum(os.path.getsize(os.path.join(hls_dir, f)) for f in bin_files)
-            seg_dur      = int(os.environ['SEG_DURATION'])
-            duration_s   = len(bin_files) * seg_dur
-            real_bitrate = int((total_bytes * 8) / duration_s) if duration_s > 0 else 2000000
-          else:
-            real_bitrate = int(os.environ.get('PROBE_BITRATE') or 2000000)
-          master = '\n'.join(['#EXTM3U','#EXT-X-VERSION:6','',
-            f'#EXT-X-STREAM-INF:BANDWIDTH={real_bitrate},RESOLUTION={eff_w}x{eff_h}',
-            f'{raw_base}/hls/index.m3u8'])
-          with open(work_dir + '/master.m3u8', 'w') as f: f.write(master)
-          print(f"✓ master.m3u8: {eff_w}x{eff_h} | {real_bitrate}bps")
-          PYEOF
-
-      - name: Gerar cdn_urls.json
-        if: env.COORDINATOR_DISPATCHED != 'true'
-        env:
-          STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
-        run: |
-          python3 << 'PYEOF'
-          import os, json
-          work_dir = os.environ['WORK_DIR']
-          job_id   = os.environ['JOB_ID']
-          owner    = os.environ['STORAGE_OWNER']
-          shard    = os.environ['SHARD_REPO']
-          branch   = os.environ['JOB_BRANCH']
-          raw_base = f"https://cdn.jsdelivr.net/gh/{owner}/{shard}@{branch}/{job_id}"
-
-          nonces = json.load(open(work_dir + '/nonces.json'))
-          thumbs = json.load(open(work_dir + '/thumbs_manifest.json'))
-
-          cdn_urls = [
-            f"{raw_base}/master.m3u8",
-            f"{raw_base}/nonces.json",
-            f"{raw_base}/hls/index.m3u8",
-            f"{raw_base}/hls/init.bin",
-          ]
-
-          seg_names = sorted(bn for bn in nonces['nonces'] if bn != 'init.bin')
-          for bn in seg_names:
-            cdn_urls.append(f"{raw_base}/hls/{bn}")
-
-          cdn_urls += [f"{raw_base}/thumbs/{os.path.basename(t['path'])}" for t in thumbs]
-
-          json.dump(cdn_urls, open(work_dir + '/cdn_urls.json', 'w'))
-          print(f"✓ cdn_urls.json gerado: {len(cdn_urls)} URLs")
-          PYEOF
-
-      - name: Commit + push dos segmentos para o shard (branch exclusiva do job)
-        if: env.COORDINATOR_DISPATCHED != 'true'
-        env:
-          STORAGE_TOKEN: ${{ env.STORAGE_TARGET_TOKEN }}
-          STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
-        run: |
-          set -e
-
-          git config --global core.deltaBaseCacheLimit 2047m
-          git config --global core.looseObjects 0
-          git config --global pack.compression 0
-          git config --global pack.window 0
-          git config --global http.postBuffer 524288000
-          git config --global http.lowSpeedLimit 0
-          git config --global http.lowSpeedTime 999999
-          git config --global repack.useDeltaBaseOffset true
-          git config --global advice.detachedHead false
-
-          REPO_URL="https://x-access-token:${STORAGE_TOKEN}@github.com/${STORAGE_OWNER}/${SHARD_REPO}.git"
-          # CIRÚRGICO: 250 → 400. Menos lotes = menos round-trips HTTP
-          # (handshake+auth por push), sem aumentar o payload a ponto de
-          # arriscar mais falhas de push grandes — o retry de 8 tentativas
-          # continua cobrindo isso.
-          BATCH_SIZE=400
-
-          rm -rf /tmp/shard
-          mkdir -p /tmp/shard
-          cd /tmp/shard
-          git init -q
-          git checkout -q -b "$JOB_BRANCH"
-          git remote add origin "$REPO_URL"
-          mkdir -p "$JOB_ID/hls" "$JOB_ID/thumbs"
-
-          push_with_retry() {
-            local batch_num="$1" total_batches="$2"
-            local max_attempts=8
-            local attempt=1
-            while [ $attempt -le $max_attempts ]; do
-              echo "→ Lote $batch_num/$total_batches — push tentativa $attempt/$max_attempts..."
-              if git push -q --force origin "$JOB_BRANCH" 2>&1; then
-                echo "✓ Lote $batch_num/$total_batches enviado (tentativa $attempt)"
-                return 0
-              fi
-              local base_wait=$((attempt * 8))
-              local jitter=$((RANDOM % 10))
-              local wait=$((base_wait + jitter))
-              echo "  ⚠ Push do lote $batch_num falhou (rede/RPC transitório — branch exclusiva, sem colisão possível) — retry em ${wait}s..."
-              sleep $wait
-              attempt=$((attempt + 1))
-            done
-            echo "✗ Lote $batch_num/$total_batches falhou após ${max_attempts} tentativas"
-            return 1
-          }
-
-          FILES_TO_SEND=()
-          while IFS= read -r -d '' f; do
-            FILES_TO_SEND+=("hls/$(basename "$f")")
-          done < <(find "$WORK_DIR/hls" -maxdepth 1 -type f -print0 | sort -z)
-
-          FILES_TO_SEND+=("master.m3u8" "nonces.json")
-
-          if [ -d "$WORK_DIR/thumbs" ] && [ -n "$(ls -A "$WORK_DIR/thumbs" 2>/dev/null)" ]; then
-            while IFS= read -r -d '' f; do
-              FILES_TO_SEND+=("thumbs/$(basename "$f")")
-            done < <(find "$WORK_DIR/thumbs" -maxdepth 1 -type f -print0 | sort -z)
-          fi
-
-          TOTAL=${#FILES_TO_SEND[@]}
-          NUM_BATCHES=$(( (TOTAL + BATCH_SIZE - 1) / BATCH_SIZE ))
-          echo "→ $TOTAL ficheiro(s) a enviar em $NUM_BATCHES lote(s) de até $BATCH_SIZE na branch $JOB_BRANCH"
-
-          idx=0
-          batch_num=0
-          while [ $idx -lt $TOTAL ]; do
-            batch_num=$((batch_num + 1))
-            batch=("${FILES_TO_SEND[@]:idx:BATCH_SIZE}")
-
-            cd /tmp/shard
-            for rel in "${batch[@]}"; do
-              mkdir -p "$JOB_ID/$(dirname "$rel")"
-              cp "$WORK_DIR/$rel" "$JOB_ID/$rel"
-            done
-
-            git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site add "$JOB_ID"
-            git -c user.name=sv-bot -c user.email=sv-bot@pixgo.frii.site commit \
-              -m "job=${JOB_ID} lote=${batch_num}/${NUM_BATCHES}" -q || true
-
-            if ! push_with_retry "$batch_num" "$NUM_BATCHES"; then
-              cd /
-              rm -rf /tmp/shard
-              echo "✗ Envio interrompido no lote $batch_num/$NUM_BATCHES"
-              exit 1
-            fi
-
-            idx=$((idx + BATCH_SIZE))
-          done
-
-          cd /
-          rm -rf /tmp/shard
-          echo "✓ Todos os $NUM_BATCHES lote(s) enviados para ${SHARD_REPO}@${JOB_BRANCH}: ${JOB_ID}"
 
       - name: Registar no EdgeOne (Turso + KV)
         if: env.COORDINATOR_DISPATCHED != 'true'
@@ -1506,6 +1518,16 @@ jobs:
           cdn_urls      = json.load(open(cdn_urls_path)) if os.path.exists(cdn_urls_path) else []
 
           content_id = metadata.get('contentId', job_id)
+          # FIX (numeração/catálogo): se contentId não veio explícito no
+          # metadata, isso é a causa mais provável de episódios da MESMA
+          # série virarem entradas separadas no catálogo — cada job cai
+          # de volta pro próprio job_id como "contentId", que é único por
+          # definição. Fica logado alto pra não passar despercebido.
+          if not metadata.get('contentId'):
+            print(f"⚠⚠ contentId ausente no metadata — usando job_id ('{content_id}') como contentId. "
+                  f"Isso impede o backend de agrupar este episódio com outros da mesma série no catálogo. "
+                  f"Corrija na origem (dispatcher/coordinator) pra sempre enviar o mesmo contentId entre "
+                  f"episódios da mesma série/filme.")
 
           season_number_env  = os.environ.get('SEASON_NUMBER', '0') or '0'
           episode_number_env = os.environ.get('EPISODE_NUMBER', '') or ''
