@@ -1311,11 +1311,27 @@ jobs:
             return False
 
           def pick_shard(exclude):
-            # FIX (shard cheio): sempre reconsulta o tamanho na hora,
-            # sem cache entre tentativas — é justamente um valor
-            # obsoleto de `size` que causou escolher um shard já cheio
-            # da primeira vez. `exclude` traz os shards já rejeitados
-            # por erro de quota NESTA run.
+            # FIX REAL (o bug de verdade, não o que eu tinha assumido antes):
+            # não era o campo `size` da API estar desatualizado — era esta
+            # função nunca checar o tamanho do shard "seguinte" antes de
+            # reutilizá-lo. MAX_SHARDS_TO_SCAN=20 limitava o scan a
+            # compiled01..20; quando nenhum tinha espaço, o código montava
+            # `compiled{n:02d}` com n=21 e chamava create_repo() direto —
+            # que recebe HTTP 422 ("já existe") e trata isso como "posso
+            # reutilizar", SEM NUNCA CONSULTAR O TAMANHO REAL desse repo.
+            # Resultado visto no log real: compiled21 já existia (criado
+            # cheio por outro job), e as 5 tentativas de shard reutilizaram
+            # o MESMO compiled21 sempre — porque esse caminho de código
+            # nunca olha pro `exclude` (que só filtra o range 1..20) nem
+            # faz GET de tamanho antes de decidir reaproveitar.
+            #
+            # Fix: SEMPRE fazer GET de tamanho antes de decidir qualquer
+            # coisa sobre um número de shard — nunca ir direto pro
+            # create_repo() sem antes confirmar (via 404) que o slot está
+            # genuinamente livre. E continuar avançando o número, PULANDO
+            # os que estão em `exclude` ou cheios, mesmo além de
+            # MAX_SHARDS_TO_SCAN — 20 é só um teto pro scan "normal", não
+            # um teto pro espaço de números de shard.
             eligible = []
             n = 1
             while n <= MAX_SHARDS_TO_SCAN:
@@ -1327,21 +1343,51 @@ jobs:
               if existe is None:
                 raise SystemExit(1)
               if not existe:
-                break
+                # Achou um número livre dentro do range normal de scan —
+                # não precisa nem procurar mais longe, pode criar aqui.
+                print(f"  → {repo} não existe ainda, a criar...")
+                if not create_repo(repo):
+                  raise SystemExit(1)
+                return repo
               size_mb = size_kb // 1024
               print(f"  {repo}: {size_mb}MB")
               if size_kb < THRESHOLD_KB:
                 eligible.append(repo)
               n += 1
+
             if eligible:
               chosen = random.choice(eligible)
               print(f"  → {len(eligible)} shard(s) elegível(eis): {eligible} — escolhido aleatoriamente: {chosen}")
               return chosen
-            new_repo = f'compiled{n:02d}'
-            print(f"  → nenhum shard com espaço livre, a criar {new_repo}...")
-            if not create_repo(new_repo):
-              raise SystemExit(1)
-            return new_repo
+
+            # Nenhum shard no range 1..MAX_SHARDS_TO_SCAN tem espaço.
+            # Continua avançando o número — SEMPRE checando via GET antes
+            # de decidir criar ou reutilizar, e pulando qualquer número
+            # já marcado em `exclude` nesta run.
+            print(f"  → nenhum shard no range 1..{MAX_SHARDS_TO_SCAN} tem espaço — procurando além disso...")
+            HARD_CEILING = 200  # trava de segurança, nunca deveria ser alcançada
+            while n <= HARD_CEILING:
+              repo = f'compiled{n:02d}'
+              if repo in exclude:
+                n += 1
+                continue
+              existe, size_kb = get_repo_size_kb(repo)
+              if existe is None:
+                raise SystemExit(1)
+              if not existe:
+                print(f"  → {repo} não existe — a criar...")
+                if not create_repo(repo):
+                  raise SystemExit(1)
+                return repo
+              size_mb = size_kb // 1024
+              if size_kb < THRESHOLD_KB:
+                print(f"  → {repo} já existe e tem espaço ({size_mb}MB) — reutilizando")
+                return repo
+              print(f"  {repo}: {size_mb}MB — cheio, avançando pro próximo número")
+              n += 1
+
+            print(f"  ✗ Nenhum slot de shard livre até compiled{HARD_CEILING:02d}")
+            raise SystemExit(1)
 
           def rewrite_urls(shard):
             raw_base = f"https://cdn.jsdelivr.net/gh/{owner}/{shard}@{job_branch}/{job_id}"
