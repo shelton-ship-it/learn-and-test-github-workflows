@@ -104,9 +104,17 @@ name: StreamVault Process (Leve)
 #      várias runs concorrentes disputando o mesmo repositório de
 #      destino (mesmo shard, mesma API), aumentando a chance de conflito
 #      de push e de rate-limit correlacionado. Fix: intervalo entre
-#      disparos elevado de 1.5s para DISPATCH_INTERVAL_SECONDS = 90
-#      (1.5min — dentro da faixa 1-2min pedida), fazendo os episódios
-#      começarem a rodar de forma escalonada, não em rajada.
+#      disparos elevado de 1.5s para DISPATCH_INTERVAL_SECONDS = 20min,
+#      fazendo os episódios começarem a rodar de forma escalonada, não
+#      em rajada.
+#      IMPORTANTE: é um temporizador FIXO, não uma espera condicional —
+#      o coordinator não verifica se a run anterior já terminou, só
+#      conta os 20min e dispara a próxima. Se um job individual levar
+#      mais que 20min (até o teto de timeout-minutes: 45), o próximo já
+#      terá sido disparado antes dele acabar — as duas runs ficam ativas
+#      ao mesmo tempo por um período. Isso é seguro porque cada job
+#      escreve numa branch exclusiva (job-<job_id>), sem colisão de
+#      escrita entre elas — só overlap de runners/API.
 # ═══════════════════════════════════════════════════════════════════════
 
 on:
@@ -499,7 +507,7 @@ jobs:
           # a run; ela começa a rodar de forma independente assim que o
           # GitHub processa o disparo). DISPATCH_INTERVAL_SECONDS abaixo
           # controla o intervalo real entre o INÍCIO de cada run filha.
-          DISPATCH_INTERVAL_SECONDS = 90  # 1.5min — ajustável entre 60 e 120
+          DISPATCH_INTERVAL_SECONDS = 20 * 60  # 20min — timer fixo entre disparos, NÃO espera o job anterior terminar
 
           def dispatch_child(child, index, total):
             for attempt in range(1, 4):
