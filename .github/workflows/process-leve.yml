@@ -51,7 +51,7 @@ name: StreamVault Process (Leve)
 #      em dht_nodes==0 nunca disparava na prática — removida, abort
 #      cedo agora é só o timeout-minutes: 45 do job inteiro.
 #
-#   5. FIX CIRÚRGICO (este patch — shard cheio):
+#   5. FIX CIRÚRGICO (patch anterior — shard cheio):
 #      "Repository is above its size quota" é um erro PERMANENTE do
 #      pre-receive hook do GitHub, não transitório. O retry antigo
 #      tratava esse erro do mesmo jeito que uma falha de rede — 8
@@ -72,7 +72,7 @@ name: StreamVault Process (Leve)
 #      Falhas de rede genuínas (não-quota) continuam com os mesmos 8
 #      retries por lote de antes, dentro do shard atual.
 #
-#   6. FIX CIRÚRGICO (este patch — numeração/catálogo de episódios):
+#   6. FIX CIRÚRGICO (patch anterior — numeração/catálogo de episódios):
 #      Quando os episódios de uma série chegam como links separados
 #      (um torrent por episódio, ex.: link A = ep1, link B = ep2), CADA
 #      chamada ao coordinator processa um torrent com 1 único ficheiro
@@ -92,6 +92,21 @@ name: StreamVault Process (Leve)
 #      `metadata.contentId` vem vazio — causa mais provável de episódios
 #      da mesma série virarem entradas separadas no catálogo, porque cada
 #      job cai de volta pro próprio job_id (único por definição) como ID.
+#
+#   7. FIX CIRÚRGICO (este patch — dispatch de episódios PARALELO → SEQUENCIAL):
+#      O `dispatch_child` já era chamado dentro de um `for`, uma chamada
+#      de cada vez (não havia concorrência no ato de disparar). O
+#      problema real é outro: `workflow_dispatch` só ENFILEIRA a run —
+#      cada run filha começa a executar (e a consumir um runner) de
+#      forma independente das outras, assim que o GitHub processa o
+#      dispatch. Com o intervalo antigo de 1.5s entre disparos, todas as
+#      runs de episódios ficavam ativas praticamente ao mesmo tempo —
+#      várias runs concorrentes disputando o mesmo repositório de
+#      destino (mesmo shard, mesma API), aumentando a chance de conflito
+#      de push e de rate-limit correlacionado. Fix: intervalo entre
+#      disparos elevado de 1.5s para DISPATCH_INTERVAL_SECONDS = 90
+#      (1.5min — dentro da faixa 1-2min pedida), fazendo os episódios
+#      começarem a rodar de forma escalonada, não em rajada.
 # ═══════════════════════════════════════════════════════════════════════
 
 on:
@@ -472,11 +487,20 @@ jobs:
             print("ERRO: STORAGE_TOKEN ou GITHUB_REPOSITORY indisponíveis")
             sys.exit(1)
 
-          # DISPATCH PARALELO — cada episódio escreve na sua própria branch
-          # exclusiva (job-<job_id>), sem necessidade de encadeamento FIFO.
-          # LEVE: 4 tentativas → 3, espera [10,30,60]s → [10,25]s — a API
-          # do GitHub raramente fica indisponível por tempo suficiente pra
-          # justificar uma 4ª tentativa com espera de 60s.
+          # DISPATCH SEQUENCIAL — cada episódio escreve na sua própria
+          # branch exclusiva (job-<job_id>), mas as runs filhas são
+          # disparadas uma de cada vez, ESPAÇADAS no tempo (não é
+          # concorrência real de escrita, é concorrência de runners/API
+          # que o espaçamento evita). FIX CIRÚRGICO (dispatch paralelo →
+          # sequencial): antes o intervalo entre disparos era de apenas
+          # 1.5s — tempo suficiente pra evitar rajada de POSTs na API do
+          # GitHub, mas insuficiente pra evitar que todas as runs filhas
+          # ficassem ativas ao mesmo tempo (workflow_dispatch só enfileira
+          # a run; ela começa a rodar de forma independente assim que o
+          # GitHub processa o disparo). DISPATCH_INTERVAL_SECONDS abaixo
+          # controla o intervalo real entre o INÍCIO de cada run filha.
+          DISPATCH_INTERVAL_SECONDS = 90  # 1.5min — ajustável entre 60 e 120
+
           def dispatch_child(child, index, total):
             for attempt in range(1, 4):
               r = subprocess.run([
@@ -505,14 +529,16 @@ jobs:
           for i, child in enumerate(children, start=1):
             if dispatch_child(child, i, len(children)):
               ok_count += 1
-            # Espaçamento entre chamadas — evita rajada de POSTs no mesmo
-            # instante (secondary rate-limit + padrão de disparo em massa
-            # correlacionado no tempo).
+            # Espaçamento SEQUENCIAL entre disparos — cada run filha só
+            # começa DISPATCH_INTERVAL_SECONDS depois da anterior, pra não
+            # sobrecarregar Actions com várias runs concorrentes do mesmo
+            # coordinator escrevendo pro mesmo destino ao mesmo tempo.
             if i < len(children):
-              time.sleep(1.5)
+              print(f"  … aguardando {DISPATCH_INTERVAL_SECONDS}s antes do próximo disparo ({i+1}/{len(children)})")
+              time.sleep(DISPATCH_INTERVAL_SECONDS)
 
           fail_count = len(children) - ok_count
-          print(f"\n✅ Coordinator: {ok_count}/{len(children)} episódio(s) disparados em paralelo" + (f" | ✗ {fail_count} falha(s)" if fail_count else ""))
+          print(f"\n✅ Coordinator: {ok_count}/{len(children)} episódio(s) disparados sequencialmente" + (f" | ✗ {fail_count} falha(s)" if fail_count else ""))
           if ok_count == 0:
             sys.exit(1)
 
