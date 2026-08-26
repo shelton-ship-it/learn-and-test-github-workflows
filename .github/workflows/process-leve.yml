@@ -93,7 +93,7 @@ name: StreamVault Process (Leve)
 #      da mesma série virarem entradas separadas no catálogo, porque cada
 #      job cai de volta pro próprio job_id (único por definição) como ID.
 #
-#   7. FIX CIRÚRGICO (este patch — dispatch de episódios PARALELO → SEQUENCIAL):
+#   7. FIX CIRÚRGICO (patch anterior — dispatch de episódios PARALELO → SEQUENCIAL):
 #      O `dispatch_child` já era chamado dentro de um `for`, uma chamada
 #      de cada vez (não havia concorrência no ato de disparar). O
 #      problema real é outro: `workflow_dispatch` só ENFILEIRA a run —
@@ -115,6 +115,37 @@ name: StreamVault Process (Leve)
 #      ao mesmo tempo por um período. Isso é seguro porque cada job
 #      escreve numa branch exclusiva (job-<job_id>), sem colisão de
 #      escrita entre elas — só overlap de runners/API.
+#
+#   8. FIX CIRÚRGICO (este patch — dorama deixa de ser "episódico"):
+#      Só 'dorama' saiu da condição de acionamento do [Coordinator]
+#      abaixo — 'series' e 'anime' continuam a acionar normalmente a
+#      detecção/separação de episódios a partir de um torrent, sem
+#      nenhuma mudança de comportamento. Motivo: o frontend
+#      (watch/[id]/page.tsx e content/[id]/page.tsx) já tratava só
+#      'dorama' como conteúdo UNITÁRIO desde a mudança de rótulo pra
+#      "Animações" (sem seletor de temporada/episódio, nunca envia
+#      `?episode=` no pedido de stream) — mas o coordinator continuava a
+#      gravar a playlist desses títulos sob a chave do EPISÓDIO
+#      (stealth_playlist_{contentId}_s{n}_e{n}), nunca sob a chave do
+#      contentId puro. Resultado: `/api/content/:id/stream` sempre
+#      devolvia 404 "Stream metadata not found" pra títulos "Animações"
+#      (ex-dorama), porque nenhum registo existia sob a chave que o
+#      frontend pedia. 'anime' NUNCA teve esse descompasso — o frontend
+#      sempre tratou 'anime' como episódico normalmente — por isso fica
+#      no Coordinator, sem alteração nenhuma.
+#      Agora dorama entra sempre com season_number/episode_number = '0'
+#      (via ingest.html → lotes A/B, igual filme/documentário) — o
+#      Coordinator não é acionado, o job processa o torrent/URL como um
+#      vídeo único, e o registo no EdgeOne fica sob o contentId puro,
+#      exatamente como o frontend espera.
+#      ATENÇÃO — trade-off assumido: sem o Coordinator, um torrent batch
+#      de dorama (vários ficheiros de vídeo num só magnet) NÃO é mais
+#      separado — o step "Detectar ficheiro de vídeo" abaixo pega sempre
+#      o PRIMEIRO vídeo encontrado e ignora o resto. Cada título dorama/
+#      "Animações" deve ser submetido como 1 torrent/URL por vídeo (um
+#      magnet por filme/OVA), nunca um torrent com vários ficheiros de
+#      uma vez. 'series' e 'anime' não têm essa limitação — continuam
+#      processando batches normalmente pelo Coordinator.
 # ═══════════════════════════════════════════════════════════════════════
 
 on:
@@ -229,7 +260,8 @@ jobs:
           python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
 
       # ═══════════════════════════════════════════════════════════════════
-      # COORDINATOR (séries/anime/dorama)
+      # COORDINATOR (séries e animes — ver FIX CIRÚRGICO #8 acima: só
+      # dorama saiu desta condição, agora processa sempre como vídeo único)
       # ═══════════════════════════════════════════════════════════════════
 
       - name: '[Coordinator] Detectar episódios e disparar jobs filhos'
@@ -238,8 +270,7 @@ jobs:
           inputs.file_indices == '' &&
           (
             contains(fromJson(inputs.metadata).type, 'series') ||
-            contains(fromJson(inputs.metadata).type, 'anime')  ||
-            contains(fromJson(inputs.metadata).type, 'dorama')
+            contains(fromJson(inputs.metadata).type, 'anime')
           ) &&
           (
             startsWith(inputs.video_url, 'magnet:') ||
