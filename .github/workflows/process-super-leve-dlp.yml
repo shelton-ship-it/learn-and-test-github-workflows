@@ -129,18 +129,18 @@ jobs:
             COOKIE_ARGS=(--cookies /tmp/cookies.txt)
           fi
 
-          # -S (sort) pede ao yt-dlp pra PREFERIR h264+aac quando essa
-          # variante existir, mantendo fallback pra VP9/AV1+Opus quando
-          # não existir (comum acima de 1080p ou uploads muito recentes).
-          # Isto não é cosmético: o step "Probe do vídeo" mais abaixo já
-          # decide sozinho -c:v copy / -c:a copy quando o codec bate certo
-          # — então o ganho real de velocidade (pular o encode quase por
-          # completo) vem inteiramente desta escolha de formato, sem
-          # precisar mudar mais nada no resto do pipeline.
+          # -S (sort) usa o MESMO $MAX_H que já vem do input
+          # max_encode_height (o "Altura máxima" do formulário) — antes
+          # estava fixo em 1080 aqui, dessincronizado do que o operador
+          # escolhe no ingest. Agora o download já vem na resolução
+          # pedida, então o probe mais abaixo ativa stream-copy direto
+          # (sem re-encode) sempre que a fonte já for h264+aac nessa
+          # altura — não só "por sorte" quando a fonte calhava de já ser
+          # 720/1080p.
           yt-dlp \
             "${COOKIE_ARGS[@]}" \
-            -S "res:1080,vcodec:h264,acodec:aac,ext:mp4:m4a" \
-            -f "bestvideo+bestaudio/best" \
+            -S "res:${MAX_H},vcodec:h264,acodec:aac,ext:mp4:m4a" \
+            -f "bestvideo[height<=${MAX_H}]+bestaudio/best[height<=${MAX_H}]" \
             --merge-output-format mp4 \
             --retries 5 \
             --fragment-retries 5 \
