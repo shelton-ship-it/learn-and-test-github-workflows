@@ -115,8 +115,13 @@ name: StreamVault Process (Leve)
 #      ao mesmo tempo por um período. Isso é seguro porque cada job
 #      escreve numa branch exclusiva (job-<job_id>), sem colisão de
 #      escrita entre elas — só overlap de runners/API.
+#      ★ SUBSTITUÍDO pelo fix 9c mais abaixo — o "overlap de runners"
+#      aceite aqui deixou de ser aceitável depois dos lotes C/D (ver
+#      9c): agora espera-se confirmação real de conclusão antes do
+#      próximo disparo, nunca mais um temporizador fixo. Descrição
+#      mantida por historial.
 #
-#   8. FIX CIRÚRGICO (este patch — dorama deixa de ser "episódico"):
+#   8. FIX CIRÚRGICO (patch anterior — dorama deixa de ser "episódico"):
 #      Só 'dorama' saiu da condição de acionamento do [Coordinator]
 #      abaixo — 'series' e 'anime' continuam a acionar normalmente a
 #      detecção/separação de episódios a partir de um torrent, sem
@@ -146,10 +151,121 @@ name: StreamVault Process (Leve)
 #      magnet por filme/OVA), nunca um torrent com vários ficheiros de
 #      uma vez. 'series' e 'anime' não têm essa limitação — continuam
 #      processando batches normalmente pelo Coordinator.
+#
+#   9. FIX CIRÚRGICO (este patch — versão final, substitui 2 tentativas
+#      anteriores descartadas, ver histórico completo abaixo):
+#
+#      9a. episode_count — pro caso "1 link cobre N episódios" (torrent
+#          com N ficheiros de vídeo pertencentes à MESMA submissão).
+#          Quando o chamador informa episode_number (início) E
+#          episode_count (quantos), E o número de ficheiros de vídeo
+#          encontrados no torrent bate exactamente com episode_count, a
+#          numeração é SEQUENCIAL e DETERMINÍSTICA (episode_number,
+#          episode_number+1, ...) pela ORDEM DOS FICHEIROS DENTRO DO
+#          TORRENT — nunca por regex/adivinhação no nome. Se não bater,
+#          cai de volta pro modo automático antigo (regex/contador) com
+#          aviso explícito no log. O caso "1 link = 1 episódio"
+#          (episode_count=1, já suportado desde o fix #6) continua
+#          idêntico. Cálculo 100% LOCAL, dentro do próprio Coordinator —
+#          nenhuma chamada de rede nova, nenhuma dependência nova.
+#          Isto cobre 2 das 3 categorias de link que o Coordinator
+#          precisa suportar: (1) link ambíguo, só se sabe 1-ou-N ao
+#          sondar o torrent — episode_count=1 (default), regex/contador
+#          decide; (2) link único DECLARADO com N episódios — episode_
+#          count>1 vindo do multi-link do ingest.html, numeração
+#          determinística. A 3ª categoria (link onde nem se conhece N —
+#          nem por declaração, nem por sondagem simples) NÃO está
+#          implementada, aqui nem em nenhum patch anterior — fica só
+#          como gap conhecido pra o dia em que isso for pedido.
+#
+#      9b. LIMITE RÍGIDO DE 10 INPUTS DO workflow_dispatch — achado
+#          crítico de plataforma (confirmado na documentação do GitHub,
+#          não assumido): um workflow com mais de 10 inputs declarados é
+#          INVÁLIDO — o GitHub recusa registá-lo, nunca chega sequer a
+#          correr. Este ficheiro já tinha chegado a 11 (job_id,
+#          video_url, thumbnail_url, seg_duration, max_encode_height,
+#          metadata, season_number, episode_number, episode_title,
+#          file_indices, episode_count) sem que isso tivesse sido
+#          detectado — só apareceu ao planear mais 2 campos novos pra
+#          9d, abaixo, o que pioraria ainda mais a situação.
+#          Fix: os inputs foram consolidados em 6 — job_id, video_url e
+#          metadata ficam como estavam; os restantes agrupam-se em 3
+#          blobs JSON por afinidade:
+#            episode_info -> season_number, episode_number,
+#                             episode_title, file_indices, episode_count
+#            encode_opts  -> seg_duration, max_encode_height,
+#                             thumbnail_url
+#            chain        -> remaining_children, chain_root_id (só usado
+#                             pela cadeia sequencial — ver 9d)
+#          A consolidação fica confinada a este ficheiro e ao /dispatch
+#          do dispatcher.js (que continua a aceitar os campos separados
+#          de sempre do Worker/ingest.html — zero mudança nesses dois —
+#          só os agrupa em JSON antes de enviar ao GitHub).
+#
+#      9c. HISTÓRICO DE 2 TENTATIVAS DESCARTADAS (mantido por registo —
+#          não fazem parte do comportamento actual):
+#          (i) Coordinator chamando o dispatcher.js pra cada filho, com
+#              parent_job/batch_total, pra dar visibilidade de filhos ao
+#              dispatcher — rejeitado: cria dependência do Coordinator
+#              num serviço Render de plano gratuito, que dorme por
+#              inactividade; um cold-start no meio do disparo de
+#              episódios já causou falha real em produção (HTTP 000).
+#          (ii) Coordinator em job separado com timeout de 8h,
+#              disparando TODOS os filhos com espaçamento fixo de 20min
+#              e depois fazendo polling directo à API do GitHub
+#              (run-name + status do run) até cada um confirmar
+#              conclusão antes do próximo — funcionalmente correcto,
+#              mas exigia o Coordinator ficar vivo (a dormir) por horas,
+#              ocupando 1 slot de runner concorrente da conta o tempo
+#              todo, só pra sondar estado. Substituído por 9d, que
+#              elimina essa necessidade.
+#
+#      9d. CADEIA SEQUENCIAL — SOLUÇÃO FINAL. Em vez do Coordinator
+#          disparar (ou sondar) todos os episódios, ele sonda o torrent,
+#          calcula a lista COMPLETA de episódios/batches, mas dispara só
+#          o PRIMEIRO — anexando ao payload desse 1º episódio, no campo
+#          `chain`, a lista dos restantes (`remaining_children`) e o
+#          `chain_root_id` (= o próprio job_id do Coordinator, que é o
+#          id que o lote C/D está de facto a rastrear). O Coordinator
+#          TERMINA logo a seguir — já não fica à espera de nada, volta
+#          a ter um timeout modesto (60min, só cobre a sondagem do
+#          torrent, que é o único tempo genuinamente imprevisível aqui).
+#          Cada episódio, DEPOIS de terminar o seu próprio trabalho
+#          (encode/push/registo — já terminou de facto, não é polling
+#          nem temporizador fixo, é só o próprio código só correr depois
+#          disso), executa o novo step "Continuar cadeia sequencial" no
+#          job `process`: se `remaining_children` ainda tiver itens,
+#          espera um gap aleatório de 10-30min (mesmo padrão do lote
+#          A/B pros filmes) e dispara o PRÓXIMO directo na API do GitHub
+#          — repassando o resto da lista e o mesmo chain_root_id; se não
+#          sobrar nada (é o último), fecha o chain_root_id como
+#          concluído através do MESMO /webhook que o dispatcher.js já
+#          tinha (nenhum endpoint novo). NUNCA 2 episódios em paralelo,
+#          por construção.
+#          FIX TRADE-OFF 1 (lote avançava rápido demais com o Coordinator
+#          leve): o Coordinator, ao disparar o 1º episódio com sucesso,
+#          NÃO reporta o seu próprio job_id como concluído — o webhook
+#          dele só dispara em falha/cancelamento. O jobStore desse
+#          job_id fica deliberadamente 'dispatched' até o ÚLTIMO elo da
+#          cadeia o fechar — o lote só avança quando a série TODA já
+#          passou pela cadeia.
+#          FIX TRADE-OFF 2 (fragilidade da cadeia): se o disparo do
+#          próximo episódio falhar (retries esgotados), esse elo fecha
+#          IMEDIATAMENTE o chain_root_id como 'failed' e loga com
+#          precisão quais job_ids nunca chegaram a ser disparados —
+#          destrava o lote em minutos em vez de esperar um teto de
+#          segurança de horas.
+#          NÃO CHAMA O DISPATCHER/RENDER pra disparar nada — só o
+#          fecho final (done/failed) do chain_root_id usa o /webhook já
+#          existente, exactamente como qualquer job sempre reportou o
+#          seu próprio fim.
 # ═══════════════════════════════════════════════════════════════════════
 
 on:
   workflow_dispatch:
+    # Consolidado em 6 inputs — limite RÍGIDO do GitHub é 10, ver fix 9b
+    # no cabeçalho. job_id/video_url/metadata ficam simples; o resto
+    # agrupa-se em 3 blobs JSON por afinidade.
     inputs:
       job_id:
         description: 'Job ID'
@@ -158,51 +274,49 @@ on:
         description: 'URL do vídeo — HTTP(S), magnet:, .torrent'
         required: false
         default: ''
-      seg_duration:
-        description: 'Duração segmento HLS (segundos)'
-        required: false
-        default: '4'
-      max_encode_height:
-        description: 'Altura máxima encode'
-        required: false
-        default: '720'
       metadata:
         description: 'JSON: { contentId, title, description, type, year, lang }'
         required: false
         default: '{}'
-      thumbnail_url:
-        description: 'URL da thumbnail (JPG/PNG)'
+      episode_info:
+        description: 'JSON: { season_number, episode_number, episode_title, file_indices, episode_count }'
         required: false
-        default: ''
-      season_number:
-        description: 'Número da temporada'
+        default: '{"season_number":"0","episode_number":"0","episode_title":"","file_indices":"","episode_count":"1"}'
+      encode_opts:
+        description: 'JSON: { seg_duration, max_encode_height, thumbnail_url }'
         required: false
-        default: '0'
-      episode_number:
-        description: 'Número do episódio'
+        default: '{"seg_duration":"4","max_encode_height":"720","thumbnail_url":""}'
+      chain:
+        description: 'JSON: { remaining_children, chain_root_id } — uso interno da cadeia sequencial de episódios (ver fix 9d)'
         required: false
-        default: '0'
-      episode_title:
-        description: 'Título do episódio'
-        required: false
-        default: ''
-      file_indices:
-        description: 'Índices dos ficheiros no torrent'
-        required: false
-        default: ''
+        default: '{"remaining_children":[],"chain_root_id":""}'
 
 jobs:
-  process:
-    # Conta pessoal — sem Blacksmith. GitHub-hosted runners são
-    # ilimitados e gratuitos pra repositório público no plano Free.
+  # ═══════════════════════════════════════════════════════════════════
+  # COORDINATOR — job separado, timeout próprio de 8h (ver fix 9b acima).
+  # Só roda pra séries/animes com link torrent/magnet e sem file_indices
+  # (filhos de episódio já vêm com file_indices preenchido — nunca caem
+  # aqui, vão direto pro job "process" abaixo, exactamente como sempre).
+  # ═══════════════════════════════════════════════════════════════════
+  coordinator:
+    if: |
+      inputs.video_url != '' &&
+      fromJson(inputs.episode_info).file_indices == '' &&
+      (
+        contains(fromJson(inputs.metadata).type, 'series') ||
+        contains(fromJson(inputs.metadata).type, 'anime')
+      ) &&
+      (
+        startsWith(inputs.video_url, 'magnet:') ||
+        endsWith(inputs.video_url, '.torrent')  ||
+        contains(inputs.video_url, 'infohash:')
+      )
     runs-on: ubuntu-latest
-    # CIRÚRGICO: 340 → 45 (ajustado de 30 → 45: job real com download
-    # legítimo levou 22min só no download, deixando pouca folga pra
-    # probe+encode+thumbnails+encriptação+push+registo). Teto duro do
-    # job inteiro — o GitHub Actions cancela sozinho ao atingir esse
-    # tempo, independente de qual step está rodando ou se a lógica de
-    # abort cedo dentro do Python falhou. Última linha de defesa.
-    timeout-minutes: 45
+    # 60min — só cobre a sondagem do torrent (metadados) + o disparo do
+    # 1º episódio, que é tudo o que este job faz agora (fix 9d). Já não
+    # precisa de 8h: não fica mais vivo à espera de nada, o resto da
+    # cadeia é responsabilidade de cada episódio, um de cada vez.
+    timeout-minutes: 60
     # actions:write necessário pro coordinator disparar episódios filhos
     # no próprio repo usando o GITHUB_TOKEN automático — workflow_dispatch
     # é uma das exceções documentadas em que o token padrão do Actions
@@ -211,105 +325,65 @@ jobs:
     permissions:
       actions: write
       contents: read
-
     env:
-      WORK_DIR:       /tmp/sv_work/${{ inputs.job_id }}
-      CHACHA_KEY:     ${{ secrets.CHACHA_KEY }}
-      PIPELINE_API:   ${{ secrets.PIPELINE_API }}
-      ADMIN_API_KEY:  ${{ secrets.ADMIN_API_KEY }}
       DISPATCHER_URL: ${{ secrets.DISPATCHER_URL }}
-
+      ADMIN_API_KEY:  ${{ secrets.ADMIN_API_KEY }}
     steps:
-      # ── 0. Preparar ambiente ─────────────────────────────────────────────
-      - name: Preparar ambiente
-        run: |
-          echo "JOB_ID=${{ inputs.job_id }}"             >> $GITHUB_ENV
-          echo "SEG_DURATION=${{ inputs.seg_duration }}" >> $GITHUB_ENV
-          echo "MAX_H=${{ inputs.max_encode_height }}"   >> $GITHUB_ENV
-          mkdir -p "/tmp/sv_work/${{ inputs.job_id }}/incoming" \
-                   "/tmp/sv_work/${{ inputs.job_id }}/hls" \
-                   "/tmp/sv_work/${{ inputs.job_id }}/thumbs"
-
-      # Cache de pacotes .deb via ação da comunidade — evita baixar
-      # ffmpeg + python3-libtorrent (e suas dependências apt) do zero em
-      # todo run. Cache por branch, até 5GB no repo; invalida sozinho se
-      # a lista de pacotes mudar (chave = hash da lista + versão abaixo).
-      - name: Instalar pacotes apt (ffmpeg + libtorrent, cache)
+      # Só libtorrent — este job nunca chama ffmpeg.
+      - name: Instalar libtorrent (cache)
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
-          packages: ffmpeg python3-libtorrent
+          packages: python3-libtorrent
           version: 1.0
-          # FIX: a ação restaura pacotes via dpkg -x (só extrai arquivos),
-          # sem rodar scripts de pós-instalação por padrão — isso deixava
-          # bibliotecas como libblas.so.3 (dependência transitiva de
-          # python3-libtorrent) no disco, mas fora do cache do linker
-          # (ldconfig), causando "error while loading shared libraries"
-          # no ffprobe/ffmpeg. execute_install_scripts roda esses scripts
-          # no restore, incluindo a atualização do ldconfig.
           execute_install_scripts: true
 
-      # Defesa extra, independente do que a ação já faz: força o cache
-      # do linker a refletir tudo que foi restaurado, cache-hit ou não.
       - name: Atualizar cache do linker (ldconfig)
         run: sudo ldconfig
 
-      - name: Instalar dependências Python (pip)
-        run: |
-          pip install --quiet --upgrade cryptography
-          ffmpeg -version | head -1
-          python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
-
-      # ═══════════════════════════════════════════════════════════════════
-      # COORDINATOR (séries e animes — ver FIX CIRÚRGICO #8 acima: só
-      # dorama saiu desta condição, agora processa sempre como vídeo único)
-      # ═══════════════════════════════════════════════════════════════════
-
       - name: '[Coordinator] Detectar episódios e disparar jobs filhos'
-        if: |
-          inputs.video_url != '' &&
-          inputs.file_indices == '' &&
-          (
-            contains(fromJson(inputs.metadata).type, 'series') ||
-            contains(fromJson(inputs.metadata).type, 'anime')
-          ) &&
-          (
-            startsWith(inputs.video_url, 'magnet:') ||
-            endsWith(inputs.video_url, '.torrent')  ||
-            contains(inputs.video_url, 'infohash:')
-          )
         env:
-          INPUT_METADATA:    ${{ inputs.metadata }}
-          INPUT_VIDEO_URL:   ${{ inputs.video_url }}
-          INPUT_THUMBNAIL:   ${{ inputs.thumbnail_url }}
-          INPUT_SEG:         ${{ inputs.seg_duration }}
-          INPUT_HEIGHT:      ${{ inputs.max_encode_height }}
-          INPUT_SEASON:      ${{ inputs.season_number }}
-          INPUT_EPISODE:     ${{ inputs.episode_number }}
-          INPUT_EP_TITLE:    ${{ inputs.episode_title }}
+          INPUT_METADATA:      ${{ inputs.metadata }}
+          INPUT_VIDEO_URL:     ${{ inputs.video_url }}
+          INPUT_EPISODE_INFO:  ${{ inputs.episode_info }}
+          INPUT_ENCODE_OPTS:   ${{ inputs.encode_opts }}
+          JOB_ID_SELF:         ${{ inputs.job_id }}
           # workflow_dispatch é uma exceção documentada — o GITHUB_TOKEN
           # automático PODE disparar outro workflow_dispatch no mesmo
           # repo (diferente de eventos como push, que não disparam, pra
           # evitar loops infinitos). Elimina a necessidade de token
           # próprio só pra esse self-dispatch.
-          STORAGE_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          STORAGE_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:   ${{ github.repository }}
         run: |
           python3 << 'PYEOF'
           import libtorrent as lt
-          import os, sys, re, json, time, subprocess, urllib.request, urllib.error
+          import os, sys, re, json, time, random, subprocess, urllib.request, urllib.error
 
           url          = os.environ['INPUT_VIDEO_URL']
           metadata_raw = os.environ['INPUT_METADATA']
-          season_num   = int(os.environ.get('INPUT_SEASON', '0') or '0')
+
+          # FIX 9b: episode_info/encode_opts chegam como blobs JSON
+          # (consolidação pra respeitar o limite de 10 inputs do
+          # workflow_dispatch — ver cabeçalho do ficheiro).
+          try:    episode_info = json.loads(os.environ.get('INPUT_EPISODE_INFO', '') or '{}')
+          except: episode_info = {}
+          try:    encode_opts  = json.loads(os.environ.get('INPUT_ENCODE_OPTS', '') or '{}')
+          except: encode_opts  = {}
+
+          season_num   = int(episode_info.get('season_number', '0') or '0')
           # FIX (numeração/catálogo): episódio e título explícitos vindos
           # do chamador — antes eram completamente ignorados pelo
           # coordinator, que sempre recalculava o número via regex no
           # nome do ficheiro, mesmo quando o chamador já sabia o número
           # certo (caso comum: um torrent por episódio, submetido um de
           # cada vez). '0' e vazio contam como "não informado".
-          input_episode_raw = (os.environ.get('INPUT_EPISODE', '') or '').strip()
+          input_episode_raw = (episode_info.get('episode_number', '') or '').strip()
           input_episode      = int(input_episode_raw) if input_episode_raw.isdigit() and input_episode_raw != '0' else None
-          input_ep_title      = os.environ.get('INPUT_EP_TITLE', '') or ''
+          input_ep_title      = episode_info.get('episode_title', '') or ''
+          # FIX 9a (multi-link/temporada): quantos episódios ESTE
+          # link/torrent cobre. '1' (default) = comportamento antigo.
+          input_episode_count_raw = (episode_info.get('episode_count', '') or '1').strip()
+          input_episode_count = int(input_episode_count_raw) if input_episode_count_raw.isdigit() and input_episode_count_raw != '0' else 1
           VIDEO_EXTS   = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.ts','.m4v','.webm','.mpg','.mpeg'}
           BATCH_LIMIT  = 1_400 * 1024 * 1024
 
@@ -392,11 +466,10 @@ jobs:
           # tracker respondeu (com erro) antes da 2ª checagem aos 30s, e
           # o job foi abortado sem qualquer chance real de achar peers.
           # Não dá pra prever com confiança quando um torrent vai achar
-          # seed — a única garantia real é o teto do job inteiro
-          # (timeout-minutes: 45, no nível do job). Regra única: deixa
-          # rodar, sem exit antecipado aqui; se não achar seed, o job é
-          # cancelado pelo GitHub Actions no teto de 45min, não por esta
-          # lógica.
+          # seed — a única garantia real é o teto do job inteiro (8h
+          # neste job, ver fix 9b). Regra única: deixa rodar, sem exit
+          # antecipado aqui; se não achar seed, o job é cancelado pelo
+          # GitHub Actions no teto, não por esta lógica.
           CHECK_INTERVAL = 15
           last_check_t   = -1
 
@@ -443,18 +516,28 @@ jobs:
               if m: return int(m.group(1))
             return None
 
-          # FIX (numeração/catálogo): caso mais comum de "link isolado por
-          # episódio" — torrent com 1 único ficheiro de vídeo. Se o
-          # chamador já informou episode_number explicitamente, usa esse
-          # valor direto, sem NENHUMA tentativa de adivinhar pelo nome —
-          # elimina tanto o "reseta pra ep1" (fallback de counter) quanto
-          # o "vira ep4-alguma-coisa" (regex pegando um número errado de
-          # dentro do nome do ficheiro, tipo resolução ou ano).
-          if len(video_files) == 1 and input_episode is not None:
+          # FIX 9a: quando o chamador informou episode_number (início) E
+          # episode_count>1, E o número de ficheiros de vídeo encontrados
+          # bate exactamente — numeração sequencial determinística pela
+          # ordem dos ficheiros no torrent, sem NENHUMA tentativa de
+          # adivinhar pelo nome.
+          if input_episode is not None and len(video_files) == input_episode_count and input_episode_count > 1:
+            for i, vf in enumerate(video_files):
+              vf['ep_num'] = input_episode + i
+            print(f"  {len(video_files)} ficheiro(s) == episode_count esperado ({input_episode_count}) — "
+                  f"numerando sequencialmente a partir de ep{input_episode:02d} pela ordem dos ficheiros "
+                  f"no torrent (ignorando qualquer padrão no nome)")
+          elif len(video_files) == 1 and input_episode is not None:
+            # Caso já existente (fix #6): torrent com 1 único ficheiro e
+            # episode_number explícito — usa direto, sem regex.
             video_files[0]['ep_num'] = input_episode
             print(f"  Episódio único com episode_number explícito: usando ep{input_episode:02d} "
                   f"(ignorando qualquer padrão no nome do ficheiro)")
           else:
+            if input_episode is not None and input_episode_count > 1:
+              print(f"  ⚠ episode_count={input_episode_count} não bate com {len(video_files)} ficheiro(s) "
+                    f"de vídeo encontrado(s) no torrent — voltando pro modo automático (regex/contador), "
+                    f"a numeração pode sair errada. Confira o link e o episode_count enviados.")
             for vf in video_files:
               vf['ep_num'] = extract_ep(vf['name'])
 
@@ -502,9 +585,9 @@ jobs:
             children.append({
               'job_id':            child_id,
               'video_url':         url,
-              'thumbnail_url':     os.environ.get('INPUT_THUMBNAIL',''),
-              'seg_duration':      os.environ.get('INPUT_SEG','4'),
-              'max_encode_height': os.environ.get('INPUT_HEIGHT','720'),
+              'thumbnail_url':     encode_opts.get('thumbnail_url', ''),
+              'seg_duration':      encode_opts.get('seg_duration', '4'),
+              'max_encode_height': encode_opts.get('max_encode_height', '720'),
               'metadata':          json.dumps(child_meta),
               'season_number':     str(season_num),
               'episode_number':    ep_numbers,
@@ -526,21 +609,15 @@ jobs:
             print("ERRO: STORAGE_TOKEN ou GITHUB_REPOSITORY indisponíveis")
             sys.exit(1)
 
-          # DISPATCH SEQUENCIAL — cada episódio escreve na sua própria
-          # branch exclusiva (job-<job_id>), mas as runs filhas são
-          # disparadas uma de cada vez, ESPAÇADAS no tempo (não é
-          # concorrência real de escrita, é concorrência de runners/API
-          # que o espaçamento evita). FIX CIRÚRGICO (dispatch paralelo →
-          # sequencial): antes o intervalo entre disparos era de apenas
-          # 1.5s — tempo suficiente pra evitar rajada de POSTs na API do
-          # GitHub, mas insuficiente pra evitar que todas as runs filhas
-          # ficassem ativas ao mesmo tempo (workflow_dispatch só enfileira
-          # a run; ela começa a rodar de forma independente assim que o
-          # GitHub processa o disparo). DISPATCH_INTERVAL_SECONDS abaixo
-          # controla o intervalo real entre o INÍCIO de cada run filha.
-          DISPATCH_INTERVAL_SECONDS = 20 * 60  # 20min — timer fixo entre disparos, NÃO espera o job anterior terminar
-
-          def dispatch_child(child, index, total):
+          # FIX 9d (versão final — ver histórico completo no cabeçalho
+          # do ficheiro): em vez de disparar (ou sondar) todos os
+          # episódios aqui, o Coordinator dispara só o PRIMEIRO, com o
+          # resto da lista anexado no seu próprio campo `chain`. Cada
+          # episódio, ao terminar (job "process", step "Continuar cadeia
+          # sequencial"), dispara o seguinte sozinho. O Coordinator
+          # termina logo a seguir a este disparo único — não fica à
+          # espera de nada.
+          def dispatch_first(dispatch_inputs):
             for attempt in range(1, 4):
               r = subprocess.run([
                 'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
@@ -548,60 +625,196 @@ jobs:
                 '-H', 'Accept: application/vnd.github+json',
                 '-H', 'X-GitHub-Api-Version: 2022-11-28',
                 f'https://api.github.com/repos/{github_repo}/actions/workflows/process-leve.yml/dispatches',
-                '-d', json.dumps({'ref': 'main', 'inputs': child}),
+                '-d', json.dumps({'ref': 'main', 'inputs': dispatch_inputs}),
               ], capture_output=True, text=True)
               code = r.stdout.strip()
               if code == '204':
-                print(f"  ✓ Episódio {index}/{total} disparado: {child['job_id']}")
+                print(f"  ✓ Episódio 1/{len(children)} disparado: {dispatch_inputs['job_id']}")
                 return True
               elif code.startswith('5') or code == '':
                 wait = [10, 25][attempt-1] if attempt <= 2 else 25
-                print(f"  ⚠ Episódio {index}/{total} tentativa {attempt}/3 — HTTP {code or 'sem resposta'} — aguarda {wait}s...")
+                print(f"  ⚠ tentativa {attempt}/3 — HTTP {code or 'sem resposta'} — aguarda {wait}s...")
                 time.sleep(wait)
               else:
-                print(f"  ✗ Episódio {index}/{total} erro HTTP {code} (não retry)")
+                print(f"  ✗ erro HTTP {code} (não retry)")
                 return False
-            print(f"  ✗ Episódio {index}/{total} falhou após 3 tentativas")
+            print(f"  ✗ falhou após 3 tentativas")
             return False
 
-          ok_count = 0
-          for i, child in enumerate(children, start=1):
-            if dispatch_child(child, i, len(children)):
-              ok_count += 1
-            # Espaçamento SEQUENCIAL entre disparos — cada run filha só
-            # começa DISPATCH_INTERVAL_SECONDS depois da anterior, pra não
-            # sobrecarregar Actions com várias runs concorrentes do mesmo
-            # coordinator escrevendo pro mesmo destino ao mesmo tempo.
-            if i < len(children):
-              print(f"  … aguardando {DISPATCH_INTERVAL_SECONDS}s antes do próximo disparo ({i+1}/{len(children)})")
-              time.sleep(DISPATCH_INTERVAL_SECONDS)
+          parent_job_id = os.environ['JOB_ID_SELF']
+          first, rest   = children[0], children[1:]
 
-          fail_count = len(children) - ok_count
-          print(f"\n✅ Coordinator: {ok_count}/{len(children)} episódio(s) disparados sequencialmente" + (f" | ✗ {fail_count} falha(s)" if fail_count else ""))
-          if ok_count == 0:
+          dispatch_inputs = {
+            'job_id':    first['job_id'],
+            'video_url': first['video_url'],
+            'metadata':  first['metadata'],
+            'episode_info': json.dumps({
+              'season_number':  first['season_number'],
+              'episode_number': first['episode_number'],
+              'episode_title':  first['episode_title'],
+              'file_indices':   first['file_indices'],
+              'episode_count':  '1',
+            }),
+            'encode_opts': json.dumps({
+              'seg_duration':      first['seg_duration'],
+              'max_encode_height': first['max_encode_height'],
+              'thumbnail_url':     first['thumbnail_url'],
+            }),
+            'chain': json.dumps({
+              'remaining_children': rest,
+              'chain_root_id': parent_job_id,
+            }),
+          }
+
+          if not dispatch_first(dispatch_inputs):
+            print("ERRO: falha ao disparar o primeiro episódio — a cadeia nunca chegou a começar")
             sys.exit(1)
 
-          # CIRÚRGICO: sys.exit(0) aqui só encerra ESTE step — o GitHub
-          # Actions continua os steps seguintes normalmente (download,
-          # encode, push...), que tentariam processar o torrent INTEIRO
-          # de novo no job "pai", só que agora sem sentido (os episódios
-          # já foram disparados como jobs filhos separados). Isso
-          # desperdiçava o tempo de job inteiro à toa — e "Registar no
-          # EdgeOne" chegava a registrar conteúdo vazio/lixo pra esse
-          # job_id. A flag abaixo é checada no `if:` de todos os steps
-          # entre aqui e o webhook final, pra pulá-los quando o
-          # coordinator já tiver assumido o trabalho.
-          with open(os.environ['GITHUB_ENV'], 'a') as f:
-            f.write("COORDINATOR_DISPATCHED=true\n")
-          sys.exit(0)
+          print(f"\n✅ Coordinator: episódio 1/{len(children)} disparado — ele próprio disparará "
+                f"os {len(rest)} restante(s) em cadeia, um de cada vez, nunca em paralelo. "
+                f"Coordinator termina aqui.")
           PYEOF
+
+      # FIX 9d (trade-off 1): reporta APENAS falha/cancelamento deste
+      # job — sucesso NÃO fecha o job_id que o lote está a rastrear
+      # (ver cabeçalho do ficheiro). Se disparou o 1º episódio com
+      # sucesso, o jobStore deste job_id fica deliberadamente
+      # 'dispatched' — só o ÚLTIMO elo da cadeia (job "process", step
+      # "Continuar cadeia sequencial") o fecha como concluído. Isto
+      # existe só pra destravar o lote RAPIDAMENTE se o Coordinator em
+      # si falhar (ex.: torrent sem seeders, erro de sondagem) — sem
+      # isto, uma falha aqui deixaria o lote à espera pra sempre.
+      - name: Notificar dispatcher (só em falha — sucesso não fecha o job pai)
+        if: failure() || cancelled()
+        continue-on-error: true
+        run: |
+          if [ -z "$DISPATCHER_URL" ]; then
+            echo "⚠ DISPATCHER_URL não configurado — webhook ignorado"
+            exit 0
+          fi
+          WEBHOOK_URL="${DISPATCHER_URL%/}/webhook"
+          echo "→ POST ${WEBHOOK_URL} (job_id=${{ inputs.job_id }}, status=failed)"
+          HTTP_CODE=$(curl -s -o /tmp/wh_resp.txt -w '%{http_code}' -X POST \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${ADMIN_API_KEY}" \
+            --max-time 20 --retry 2 --retry-delay 3 \
+            "${WEBHOOK_URL}" \
+            -d "{\"job_id\":\"${{ inputs.job_id }}\",\"status\":\"failed\"}") || true
+          if [[ "$HTTP_CODE" =~ ^2 ]]; then
+            echo "✓ Webhook enviado (HTTP $HTTP_CODE)"
+          else
+            echo "✗ Webhook falhou (HTTP $HTTP_CODE) — não fatal, resposta:"
+            cat /tmp/wh_resp.txt 2>/dev/null || true
+          fi
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PROCESS — job de encode, timeout inalterado (45min). Roda pra tudo
+  # que NÃO passou pelo Coordinator: filme/documentário/dorama, série ou
+  # anime por link directo, e qualquer filho de episódio (já vem com
+  # file_indices preenchido, então "coordinator" acima é sempre pulado
+  # pra ele — ver fix 9b no topo).
+  # ═══════════════════════════════════════════════════════════════════
+  process:
+    needs: coordinator
+    if: |
+      always() && needs.coordinator.result == 'skipped'
+    runs-on: ubuntu-latest
+    # CIRÚRGICO: 340 → 45 (ajustado de 30 → 45: job real com download
+    # legítimo levou 22min só no download, deixando pouca folga pra
+    # probe+encode+thumbnails+encriptação+push+registo). Teto duro do
+    # job inteiro — o GitHub Actions cancela sozinho ao atingir esse
+    # tempo, independente de qual step está rodando. Última linha de
+    # defesa. INALTERADO pelo fix 9b — só o Coordinator ganhou teto
+    # próprio, este job de encode continua exactamente como sempre foi.
+    timeout-minutes: 45
+    # actions:write — necessário pro novo step "Continuar cadeia
+    # sequencial" (fix 9d), que precisa de disparar o próximo episódio
+    # da cadeia usando o GITHUB_TOKEN automático, exactamente como o
+    # Coordinator já fazia. Só entra em uso quando este job faz parte de
+    # uma cadeia (`chain.chain_root_id` não vazio) — pra submissões
+    # normais (filme/doc/dorama, série via link directo) o step não faz
+    # nada, mas a permissão precisa de estar declarada ao nível do job
+    # de qualquer forma.
+    permissions:
+      actions: write
+      contents: read
+
+    env:
+      WORK_DIR:       /tmp/sv_work/${{ inputs.job_id }}
+      CHACHA_KEY:     ${{ secrets.CHACHA_KEY }}
+      PIPELINE_API:   ${{ secrets.PIPELINE_API }}
+      ADMIN_API_KEY:  ${{ secrets.ADMIN_API_KEY }}
+      DISPATCHER_URL: ${{ secrets.DISPATCHER_URL }}
+
+    steps:
+      # ── 0. Preparar ambiente ─────────────────────────────────────────────
+      # Parseia episode_info/encode_opts UMA VEZ aqui e grava em
+      # GITHUB_ENV — todos os steps seguintes deste job herdam estas
+      # variáveis automaticamente (env definido via GITHUB_ENV persiste
+      # pro resto do job), sem precisar redeclarar `${{ inputs.X }}` no
+      # `env:` de cada step individualmente (como era antes da
+      # consolidação em episode_info/encode_opts — ver fix 9b).
+      - name: Preparar ambiente
+        env:
+          INPUT_EPISODE_INFO: ${{ inputs.episode_info }}
+          INPUT_ENCODE_OPTS:  ${{ inputs.encode_opts }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json
+          try:    episode_info = json.loads(os.environ.get('INPUT_EPISODE_INFO', '') or '{}')
+          except: episode_info = {}
+          try:    encode_opts  = json.loads(os.environ.get('INPUT_ENCODE_OPTS', '') or '{}')
+          except: encode_opts  = {}
+
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f"SEASON_NUMBER={episode_info.get('season_number', '0')}\n")
+            f.write(f"EPISODE_NUMBER={episode_info.get('episode_number', '')}\n")
+            f.write(f"EPISODE_TITLE={episode_info.get('episode_title', '')}\n")
+            f.write(f"FILE_INDICES={episode_info.get('file_indices', '')}\n")
+            f.write(f"SEG_DURATION={encode_opts.get('seg_duration', '4')}\n")
+            f.write(f"MAX_H={encode_opts.get('max_encode_height', '720')}\n")
+            f.write(f"THUMBNAIL_URL={encode_opts.get('thumbnail_url', '')}\n")
+          PYEOF
+          echo "JOB_ID=${{ inputs.job_id }}" >> $GITHUB_ENV
+          mkdir -p "/tmp/sv_work/${{ inputs.job_id }}/incoming" \
+                   "/tmp/sv_work/${{ inputs.job_id }}/hls" \
+                   "/tmp/sv_work/${{ inputs.job_id }}/thumbs"
+
+      # Cache de pacotes .deb via ação da comunidade — evita baixar
+      # ffmpeg + python3-libtorrent (e suas dependências apt) do zero em
+      # todo run. Cache por branch, até 5GB no repo; invalida sozinho se
+      # a lista de pacotes mudar (chave = hash da lista + versão abaixo).
+      - name: Instalar pacotes apt (ffmpeg + libtorrent, cache)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: ffmpeg python3-libtorrent
+          version: 1.0
+          # FIX: a ação restaura pacotes via dpkg -x (só extrai arquivos),
+          # sem rodar scripts de pós-instalação por padrão — isso deixava
+          # bibliotecas como libblas.so.3 (dependência transitiva de
+          # python3-libtorrent) no disco, mas fora do cache do linker
+          # (ldconfig), causando "error while loading shared libraries"
+          # no ffprobe/ffmpeg. execute_install_scripts roda esses scripts
+          # no restore, incluindo a atualização do ldconfig.
+          execute_install_scripts: true
+
+      # Defesa extra, independente do que a ação já faz: força o cache
+      # do linker a refletir tudo que foi restaurado, cache-hit ou não.
+      - name: Atualizar cache do linker (ldconfig)
+        run: sudo ldconfig
+
+      - name: Instalar dependências Python (pip)
+        run: |
+          pip install --quiet --upgrade cryptography
+          ffmpeg -version | head -1
+          python3 -c "import libtorrent as lt; print(f'✓ libtorrent {lt.version}')"
 
       # ═══════════════════════════════════════════════════════════════════
       # DOWNLOAD / ENCODE / ENCRIPTAÇÃO
       # ═══════════════════════════════════════════════════════════════════
 
       - name: '[Modo A] Descarregar vídeo'
-        if: inputs.video_url != '' && env.COORDINATOR_DISPATCHED != 'true'
+        if: inputs.video_url != ''
         run: |
           URL="${{ inputs.video_url }}"
           if [[ "$URL" == magnet:* ]] || [[ "$URL" == *.torrent ]] || [[ "$URL" == *infohash:* ]]; then
@@ -779,7 +992,7 @@ jobs:
           fi
         env:
           video_url_env:    ${{ inputs.video_url }}
-          FILE_INDICES_ENV: ${{ inputs.file_indices }}
+          FILE_INDICES_ENV: ${{ env.FILE_INDICES }}
 
       - name: '[Modo B] Obter vídeo via Artifact'
         if: inputs.video_url == ''
@@ -789,10 +1002,8 @@ jobs:
           path: ${{ env.WORK_DIR }}/incoming/
 
       - name: Detectar ficheiro de vídeo (+ extrair .rar/.zip se necessário)
-        if: env.COORDINATOR_DISPATCHED != 'true'
         run: |
           VIDEO_EXTS="mp4 mkv avi mov wmv flv ts m4v webm mpg mpeg video"
-          FILE_INDICES="${{ inputs.file_indices }}"
           if [ -n "$FILE_INDICES" ]; then
             echo "→ Modo worker | file_indices: $FILE_INDICES"
           fi
@@ -824,7 +1035,7 @@ jobs:
                 unrar-free -x "$RAR_FILES" "$EXTRACT_DIR/" && echo "✓ unrar-free concluído"
               else
                 echo "  unrar não disponível — tentando bsdtar"
-                bsdtar -x -f "$RAR_FILES" -C "$EXTRACT_DIR/" && echo "✓ bsdtar concluído"
+                bsdtar -x -f "$RAR_FILES" "$EXTRACT_DIR/" && echo "✓ bsdtar concluído"
               fi
               VIDEO_PATH=$(find_video)
             elif [ -n "$ZIP_FILES" ]; then
@@ -852,7 +1063,6 @@ jobs:
           echo "✓ Vídeo: $VIDEO_PATH ($(du -sh "$VIDEO_PATH" | cut -f1))"
 
       - name: Probe do vídeo
-        if: env.COORDINATOR_DISPATCHED != 'true'
         run: |
           ffprobe -v quiet -print_format json -show_streams -show_format "$VIDEO_PATH" > "$WORK_DIR/probe.json"
           python3 << 'PYEOF'
@@ -926,7 +1136,6 @@ jobs:
           PYEOF
 
       - name: HLS encode (stream copy se h264 nativo, senão libx264 ultrafast CRF26)
-        if: env.COORDINATOR_DISPATCHED != 'true'
         run: |
           HLS_DIR="$WORK_DIR/hls"
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
@@ -1004,9 +1213,8 @@ jobs:
           echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
 
       - name: Obter thumbnails
-        if: env.COORDINATOR_DISPATCHED != 'true'
         env:
-          INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
+          INPUT_THUMBNAIL_URL: ${{ env.THUMBNAIL_URL }}
         run: |
           python3 << 'PYEOF'
           import subprocess, os, json
@@ -1090,7 +1298,6 @@ jobs:
           PYEOF
 
       - name: Encriptar segmentos → .bin
-        if: env.COORDINATOR_DISPATCHED != 'true'
         run: |
           python3 << 'PYEOF'
           import os, json, secrets, struct
@@ -1173,7 +1380,6 @@ jobs:
       #   repos de shard dessa conta.
 
       - name: Gerar token de instalação da App (conta de storage)
-        if: env.COORDINATOR_DISPATCHED != 'true'
         env:
           STORAGE_OWNER:          ${{ secrets.STORAGE_OWNER }}
           STORAGE_APP_ID:         ${{ secrets.STORAGE_APP_ID }}
@@ -1243,7 +1449,6 @@ jobs:
       # ═══════════════════════════════════════════════════════════════════
 
       - name: Definir branch exclusiva do job
-        if: env.COORDINATOR_DISPATCHED != 'true'
         run: |
           python3 << 'PYEOF'
           import os, re
@@ -1259,7 +1464,6 @@ jobs:
           PYEOF
 
       - name: Escolher shard, gerar URLs e enviar (com fallback automático de shard cheio)
-        if: env.COORDINATOR_DISPATCHED != 'true'
         env:
           STORAGE_TOKEN: ${{ env.STORAGE_TARGET_TOKEN }}
           STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
@@ -1585,14 +1789,9 @@ jobs:
           PYEOF
 
       - name: Registar no EdgeOne (Turso + KV)
-        if: env.COORDINATOR_DISPATCHED != 'true'
         continue-on-error: true
         env:
           METADATA:       ${{ inputs.metadata }}
-          SEASON_NUMBER:  ${{ inputs.season_number }}
-          EPISODE_NUMBER: ${{ inputs.episode_number }}
-          EPISODE_TITLE:  ${{ inputs.episode_title }}
-          FILE_INDICES:   ${{ inputs.file_indices }}
           STORAGE_OWNER:  ${{ env.STORAGE_TARGET_OWNER }}
         run: |
           python3 << 'PYEOF'
@@ -1671,7 +1870,13 @@ jobs:
           PYEOF
 
       - name: Notificar dispatcher (webhook FIFO)
-        if: success() || failure()
+        # FIX (incidente lote D — 10/09): success()/failure() NÃO cobrem
+        # cancelled(). Quando timeout-minutes:45 cancela o job (correto),
+        # este step ficava pulado por inteiro — o webhook nunca disparava.
+        # always() garante que corre em qualquer desfecho — mesmo padrão
+        # já usado no step "Cleanup" mais abaixo, que por isso sempre
+        # correu normalmente após um timeout.
+        if: always()
         continue-on-error: true
         run: |
           if [ -z "$DISPATCHER_URL" ]; then
@@ -1707,6 +1912,140 @@ jobs:
             echo "✗ Webhook falhou (HTTP $HTTP_CODE) — não fatal, resposta:"
             cat /tmp/wh_resp.txt 2>/dev/null || true
           fi
+
+      # FIX 9d — CADEIA SEQUENCIAL (ver cabeçalho do ficheiro). Só faz
+      # alguma coisa quando este job faz parte de uma cadeia
+      # (chain.chain_root_id não vazio) — submissões normais (filme/
+      # doc/dorama, série via link directo) saem no primeiro if.
+      # Corre SEMPRE (if: always()), independente do sucesso/falha deste
+      # episódio — uma falha de ENCODE de um episódio não deve impedir a
+      # tentativa de disparar o seguinte (conteúdo diferente, falha não
+      # correlacionada); só uma falha de DISPARO (retries esgotados)
+      # interrompe a cadeia de facto.
+      - name: Continuar cadeia sequencial (disparar próximo episódio, se houver)
+        if: always()
+        continue-on-error: true
+        env:
+          INPUT_CHAIN:       ${{ inputs.chain }}
+          STORAGE_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, subprocess, time, random
+
+          try:    chain = json.loads(os.environ.get('INPUT_CHAIN', '') or '{}')
+          except: chain = {}
+
+          chain_root_id = chain.get('chain_root_id', '') or ''
+          remaining     = chain.get('remaining_children', []) or []
+
+          if not chain_root_id:
+            print("→ Este job não faz parte de uma cadeia sequencial — nada a fazer.")
+            raise SystemExit(0)
+
+          storage_token  = os.environ.get('STORAGE_TOKEN', '')
+          github_repo    = os.environ.get('GITHUB_REPOSITORY', '')
+          dispatcher_url = os.environ.get('DISPATCHER_URL', '').rstrip('/')
+          admin_key      = os.environ.get('ADMIN_API_KEY', '')
+
+          def notify_chain_root(status):
+            """Fecha (ou reporta falha d)o job_id que o lote C/D está a
+            rastrear — mesmo /webhook que qualquer job já usa pra
+            reportar o seu próprio fim, só que aqui reporta em nome do
+            chain_root_id, não do job_id deste próprio episódio (que já
+            se reportou a si mesmo no step anterior)."""
+            if not dispatcher_url:
+              print(f"  ⚠ DISPATCHER_URL não configurado — não foi possível reportar chain_root_id={chain_root_id}")
+              return
+            subprocess.run([
+              'curl', '-s', '-o', '/dev/null', '-X', 'POST',
+              '-H', 'Content-Type: application/json',
+              '-H', f'x-api-key: {admin_key}',
+              '--max-time', '20', '--retry', '2', '--retry-delay', '3',
+              f'{dispatcher_url}/webhook',
+              '-d', json.dumps({'job_id': chain_root_id, 'status': status}),
+            ], capture_output=True)
+            print(f"  → chain_root_id={chain_root_id} reportado como '{status}'")
+
+          if not remaining:
+            # Último elo da cadeia — fecha o job pai que o lote está a
+            # rastrear. Reflecte o desfecho DESTE episódio (cada
+            # episódio já reporta o seu PRÓPRIO job_id individualmente
+            # no step anterior — isto é só o fecho do chain_root_id).
+            final_status = 'done' if '${{ job.status }}' == 'success' else 'failed'
+            print(f"→ Último episódio da cadeia — a fechar chain_root_id={chain_root_id} como '{final_status}'")
+            notify_chain_root(final_status)
+            raise SystemExit(0)
+
+          if not storage_token or not github_repo:
+            print("  ✗ STORAGE_TOKEN/GITHUB_REPOSITORY indisponíveis — impossível continuar a cadeia")
+            notify_chain_root('failed')
+            raise SystemExit(0)
+
+          next_child = remaining[0]
+          rest_after = remaining[1:]
+
+          gap = random.randint(10 * 60, 30 * 60)
+          print(f"  … aguardando {gap // 60}min de folga antes do próximo episódio da cadeia")
+          time.sleep(gap)
+
+          dispatch_inputs = {
+            'job_id':    next_child['job_id'],
+            'video_url': next_child['video_url'],
+            'metadata':  next_child['metadata'],
+            'episode_info': json.dumps({
+              'season_number':  next_child['season_number'],
+              'episode_number': next_child['episode_number'],
+              'episode_title':  next_child['episode_title'],
+              'file_indices':   next_child['file_indices'],
+              'episode_count':  '1',
+            }),
+            'encode_opts': json.dumps({
+              'seg_duration':      next_child['seg_duration'],
+              'max_encode_height': next_child['max_encode_height'],
+              'thumbnail_url':     next_child['thumbnail_url'],
+            }),
+            'chain': json.dumps({
+              'remaining_children': rest_after,
+              'chain_root_id': chain_root_id,
+            }),
+          }
+
+          def dispatch_next():
+            for attempt in range(1, 4):
+              r = subprocess.run([
+                'curl', '-sf', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
+                '-H', f'Authorization: Bearer {storage_token}',
+                '-H', 'Accept: application/vnd.github+json',
+                '-H', 'X-GitHub-Api-Version: 2022-11-28',
+                f'https://api.github.com/repos/{github_repo}/actions/workflows/process-leve.yml/dispatches',
+                '-d', json.dumps({'ref': 'main', 'inputs': dispatch_inputs}),
+              ], capture_output=True, text=True)
+              code = r.stdout.strip()
+              if code == '204':
+                print(f"  ✓ Próximo episódio da cadeia disparado: {next_child['job_id']} ({len(rest_after)} restante(s) depois dele)")
+                return True
+              elif code.startswith('5') or code == '':
+                wait = [10, 25][attempt-1] if attempt <= 2 else 25
+                print(f"  ⚠ tentativa {attempt}/3 — HTTP {code or 'sem resposta'} — aguarda {wait}s...")
+                time.sleep(wait)
+              else:
+                print(f"  ✗ erro HTTP {code} (não retry)")
+                return False
+            return False
+
+          if dispatch_next():
+            print("  → cadeia continua — este job termina aqui, o próximo cuida do resto")
+          else:
+            # FIX trade-off 2 (fragilidade da cadeia): sem isto, a falha
+            # ficava invisível até um teto de segurança de horas no
+            # lote. Reporta já como 'failed' e loga com precisão quantos
+            # episódios NUNCA chegarão a ser disparados.
+            skipped = [next_child['job_id']] + [c['job_id'] for c in rest_after]
+            print(f"  ✗ Falha ao disparar o próximo episódio da cadeia — {len(skipped)} episódio(s) NUNCA "
+                  f"serão disparados: {', '.join(skipped)}")
+            notify_chain_root('failed')
+          PYEOF
 
       - name: Cleanup
         if: always()
