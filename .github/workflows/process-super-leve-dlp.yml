@@ -147,6 +147,7 @@ jobs:
           # 720/1080p.
           yt-dlp \
             "${COOKIE_ARGS[@]}" \
+            --remote-components ejs:github \
             -S "res:${MAX_H},vcodec:h264,acodec:aac,ext:mp4:m4a" \
             -f "bestvideo[height<=${MAX_H}]+bestaudio/best[height<=${MAX_H}]" \
             --merge-output-format mp4 \
