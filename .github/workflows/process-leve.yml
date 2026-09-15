@@ -551,6 +551,24 @@ jobs:
                 used_nums.add(counter)
                 counter += 1
 
+          # BUG REAL (causa da ordem de disparo "salada" reportada pelo
+          # user): video_files chegava aqui na ordem em que o torrent
+          # lista os ficheiros internamente (fs.file_path(i)) — ordem
+          # essa que NÃO é garantida bater com a ordem cronológica dos
+          # episódios (depende de como a ferramenta que criou o torrent
+          # enumerou os ficheiros). O branch determinístico (FIX 9a,
+          # acima) já atribuía ep_num pela própria ordem do torrent, então
+          # ficava por acaso correcto; mas o branch de fallback (regex/
+          # contador, usado sempre que episode_count não bate ou não foi
+          # informado) extraía o ep_num de cada ficheiro nessa MESMA
+          # ordem sem nunca reordenar depois — os `batches`/`children`
+          # logo a seguir, e portanto a ORDEM DE DISPARO de toda a
+          # cadeia sequencial, saíam na ordem do torrent, não na ordem
+          # dos episódios. Fix: ordenar sempre por ep_num antes de
+          # batchear — no-op no branch determinístico (já vem ordenado),
+          # corrige o branch de fallback.
+          video_files.sort(key=lambda vf: vf['ep_num'])
+
           for vf in video_files:
             print(f"  [{vf['index']:2d}] ep{vf['ep_num']:02d} | {vf['name']} | {vf['size']//(1024*1024)}MB")
 
