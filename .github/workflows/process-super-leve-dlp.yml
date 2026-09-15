@@ -107,7 +107,7 @@ jobs:
 
       - name: Instalar dependências Python (pip) + Deno (runtime JS do yt-dlp)
         run: |
-          pip install --quiet --upgrade cryptography yt-dlp
+          pip install --quiet --upgrade cryptography yt-dlp pynacl
           ffmpeg -version | head -1
           yt-dlp --version
           # yt-dlp recente precisa de um runtime JS (Deno) pra gerar os
@@ -170,6 +170,62 @@ jobs:
             echo "⚠ Ficheiro demasiado pequeno — download provavelmente falhou"
             exit 1
           fi
+
+      - name: Renovar cookie do yt-dlp (self-refresh)
+        # yt-dlp regrava /tmp/cookies.txt no fim, com os tokens de sessão
+        # rotativos renovados (__Secure-3PSIDTS e afins). Sem isto, esses
+        # tokens expiram em dias/semanas e o secret YTDLP_COOKIES precisa
+        # de ser refeito à mão sempre que isso acontece. Não elimina a
+        # necessidade de login manual por completo — só torna raro (o
+        # Google ainda pode forçar reautenticação por deteção de anomalia
+        # ou inatividade prolongada), mas resolve o caso comum.
+        if: env.YTDLP_COOKIES != ''
+        continue-on-error: true
+        env:
+          SECRETS_UPDATE_PAT: ${{ secrets.SECRETS_UPDATE_PAT }}
+        run: |
+          if [ ! -f /tmp/cookies.txt ]; then
+            echo "sem /tmp/cookies.txt — nada a renovar"
+            exit 0
+          fi
+          if [ -z "$SECRETS_UPDATE_PAT" ]; then
+            echo "⚠ SECRETS_UPDATE_PAT não configurado — a saltar renovação (o job continua normalmente)"
+            exit 0
+          fi
+          python3 << 'PYEOF'
+          import os, json, base64, urllib.request, urllib.error
+          from nacl import encoding, public
+
+          repo  = os.environ['GITHUB_REPOSITORY']
+          token = os.environ['SECRETS_UPDATE_PAT']
+
+          with open('/tmp/cookies.txt') as f:
+            cookie_content = f.read()
+
+          def api(method, path, data=None):
+            req = urllib.request.Request(
+              f'https://api.github.com{path}', method=method,
+              headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json',
+                       'X-GitHub-Api-Version': '2022-11-28'},
+              data=json.dumps(data).encode() if data is not None else None)
+            with urllib.request.urlopen(req, timeout=20) as r:
+              body = r.read()
+              return json.loads(body) if body else {}
+
+          try:
+            pk = api('GET', f'/repos/{repo}/actions/secrets/public-key')
+            public_key = public.PublicKey(pk['key'].encode('utf-8'), encoding.Base64Encoder())
+            sealed = public.SealedBox(public_key).encrypt(cookie_content.encode('utf-8'))
+            encrypted_value = base64.b64encode(sealed).decode('utf-8')
+
+            api('PUT', f'/repos/{repo}/actions/secrets/YTDLP_COOKIES', {
+              'encrypted_value': encrypted_value,
+              'key_id': pk['key_id'],
+            })
+            print("✓ YTDLP_COOKIES actualizado com os cookies renovados por este job")
+          except urllib.error.HTTPError as e:
+            print(f"⚠ Falha ao renovar YTDLP_COOKIES (não fatal): HTTP {e.code} {e.read().decode()[:300]}")
+          PYEOF
 
       - name: Probe do vídeo
         run: |
