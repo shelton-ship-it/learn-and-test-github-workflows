@@ -105,11 +105,19 @@ jobs:
       - name: Atualizar cache do linker (ldconfig)
         run: sudo ldconfig
 
-      - name: Instalar dependências Python (pip)
+      - name: Instalar dependências Python (pip) + Deno (runtime JS do yt-dlp)
         run: |
           pip install --quiet --upgrade cryptography yt-dlp
           ffmpeg -version | head -1
           yt-dlp --version
+          # yt-dlp recente precisa de um runtime JS (Deno) pra gerar os
+          # tokens de assinatura do YouTube — sem isto, alguns formatos
+          # ficam indisponíveis e o aviso "No supported JavaScript
+          # runtime" aparece (visto em teste real). curl é mais rápido
+          # e não depende de repositório apt de terceiros.
+          curl -fsSL https://deno.land/install.sh | sh -s -- -y
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          "$HOME/.deno/bin/deno" --version
 
       # ═══════════════════════════════════════════════════════════════════
       # DOWNLOAD — yt-dlp, único modo suportado. Seletor adaptativo (nunca
@@ -748,7 +756,7 @@ jobs:
           WEBHOOK_URL="${DISPATCHER_URL%/}/dlp/webhook"
           echo "→ POST ${WEBHOOK_URL} (job_id=${EFFECTIVE_JOB_ID}, status=${WEBHOOK_STATUS})"
           HTTP_CODE=$(curl -s -o /tmp/wh_resp.txt -w '%{http_code}' -X POST \
-            -H "Content-Type: application/json" -H "x-api-key: ${ADMIN_API_KEY}" \
+            -H "Content-Type: application/json" -H "x-api-key: ${ADMIN_API_KEY_YT}" \
             --max-time 20 --retry 2 --retry-delay 3 "${WEBHOOK_URL}" \
             -d "{\"job_id\":\"${EFFECTIVE_JOB_ID}\",\"status\":\"${WEBHOOK_STATUS}\"}") || true
           if [[ "$HTTP_CODE" =~ ^2 ]]; then echo "✓ Webhook enviado (HTTP $HTTP_CODE)"; else
