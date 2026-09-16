@@ -20,6 +20,24 @@ name: StreamVault Process (Super Leve DLP)
 # master.m3u8/nonces.json/cdn_urls.json, token de instalação da App de
 # storage, registo no EdgeOne, webhook, cleanup.
 #
+# ADICIONADO — provedor de PO Token (bgutil-ytdlp-pot-provider): o
+# YouTube passou a exigir um "Proof-of-Origin token" (gerado via o
+# BotGuard dele) pra muitos pedidos vindos de IPs de datacenter — que é
+# exatamente o caso dos runners do GitHub Actions — e sem esse token
+# aparece o erro "Sign in to confirm you're not a bot", mesmo em vídeo
+# 100% público. Antes disto, a única defesa eram os cookies passados
+# via YTDLP_COOKIES, que rodam periodicamente e exigem re-exportar do
+# browser à mão sempre que expiram de vez (não há como automatizar essa
+# parte). O bgutil resolve isso de outra forma: sobe um servidor local
+# (Node.js) que emula o BotGuard e gera o token NA HORA a cada pedido —
+# não é uma credencial estática que expira, então não há nada pra
+# renovar manualmente. Corre nativo, sem Docker (só precisa de Node.js
+# + git, que o runner já tem via actions/setup-node abaixo): sobe no
+# início do job, fica em background durante o download, e é encerrado
+# no passo de Cleanup no fim. Os cookies continuam no workflow como
+# camada extra (ainda úteis pra conteúdo idade-restrito), mas deixam de
+# ser a única coisa seguindo o pedido contra o bloqueio de bot.
+#
 # contentId = sempre o video_id do YouTube (vem do metadata montado no
 # ingest/worker) — estável, nunca ambíguo.
 #
@@ -120,6 +138,59 @@ jobs:
           "$HOME/.deno/bin/deno" --version
 
       # ═══════════════════════════════════════════════════════════════════
+      # PO TOKEN — provedor bgutil nativo (sem Docker). Resolve o bloqueio
+      # de bot do YouTube sem depender de cookies renovados à mão (ver
+      # comentário no topo do ficheiro). Precisa de subir ANTES do passo
+      # de download, e fica vivo em background até o Cleanup no fim.
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: Instalar Node.js para o provedor de PO Token (bgutil)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Subir provedor de PO Token (bgutil) — nativo, sem Docker
+        run: |
+          BGUTIL_VERSION="2.0.0"
+          BGUTIL_DIR="/tmp/bgutil-ytdlp-pot-provider"
+
+          # servidor em si (gera o PO Token emulando o BotGuard do
+          # YouTube) — só Node.js + git, ambos já disponíveis no runner
+          # (Node via actions/setup-node acima).
+          git clone --quiet --single-branch --branch "$BGUTIL_VERSION" \
+            https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git "$BGUTIL_DIR"
+          cd "$BGUTIL_DIR/server"
+          npm ci --silent
+          npx tsc
+
+          # arranca em background — este processo tem de continuar vivo
+          # durante o resto do job; é encerrado no passo de Cleanup.
+          nohup node build/main.js > /tmp/bgutil-server.log 2>&1 &
+          echo $! > /tmp/bgutil-server.pid
+
+          # espera a porta 4416 responder (até 20s) antes de seguir — sem
+          # isto, o primeiro pedido do yt-dlp pode chegar antes do
+          # servidor estar pronto. Testa só a porta (sem assumir nenhum
+          # endpoint HTTP específico).
+          for i in $(seq 1 20); do
+            if (echo > /dev/tcp/127.0.0.1/4416) 2>/dev/null; then
+              echo "✓ Servidor bgutil a responder na porta 4416 (tentativa ${i})"
+              break
+            fi
+            if [ "$i" -eq 20 ]; then
+              echo "⚠ Servidor bgutil não respondeu em 20s — log:"
+              cat /tmp/bgutil-server.log 2>/dev/null || true
+            fi
+            sleep 1
+          done
+          cd - > /dev/null
+
+          # plugin do lado Python — o yt-dlp deteta e usa o servidor
+          # local sozinho, nenhuma flag extra é precisa no comando de
+          # download (ver passo "Descarregar vídeo" abaixo, inalterado).
+          pip install --quiet -U bgutil-ytdlp-pot-provider
+
+      # ═══════════════════════════════════════════════════════════════════
       # DOWNLOAD — yt-dlp, único modo suportado. Seletor adaptativo (nunca
       # itag fixo — os números mudam por vídeo/qualidade disponível).
       # ═══════════════════════════════════════════════════════════════════
@@ -129,6 +200,9 @@ jobs:
           VIDEO_URL: ${{ inputs.video_url }}
           # Opcional: cookies de sessão em formato Netscape, se o canal
           # tiver conteúdo idade-restrita ou o runner começar a levar 429.
+          # Continua a existir como camada extra ao lado do PO Token
+          # (bgutil, acima) — não é mais a única defesa contra o bloqueio
+          # de bot.
           YTDLP_COOKIES: ${{ secrets.YTDLP_COOKIES }}
         run: |
           COOKIE_ARGS=()
@@ -178,7 +252,10 @@ jobs:
         # de ser refeito à mão sempre que isso acontece. Não elimina a
         # necessidade de login manual por completo — só torna raro (o
         # Google ainda pode forçar reautenticação por deteção de anomalia
-        # ou inatividade prolongada), mas resolve o caso comum.
+        # ou inatividade prolongada), mas resolve o caso comum. Com o
+        # PO Token (bgutil, acima) a assumir a parte principal do
+        # anti-bot, este passo passa a ser um extra, não a única rede de
+        # segurança.
         if: env.YTDLP_COOKIES != ''
         continue-on-error: true
         env:
@@ -825,4 +902,10 @@ jobs:
           rm -rf "$WORK_DIR"
           rm -rf /tmp/shard
           rm -f /tmp/wh_resp.txt /tmp/cookies.txt
+          # encerra o servidor de PO Token (bgutil), se ainda estiver vivo
+          if [ -f /tmp/bgutil-server.pid ]; then
+            kill "$(cat /tmp/bgutil-server.pid)" 2>/dev/null || true
+            rm -f /tmp/bgutil-server.pid /tmp/bgutil-server.log
+          fi
+          rm -rf /tmp/bgutil-ytdlp-pot-provider
           echo "✓ Workspace limpo"
