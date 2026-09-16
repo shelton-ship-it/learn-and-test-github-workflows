@@ -125,7 +125,16 @@ jobs:
 
       - name: Instalar dependências Python (pip) + Deno (runtime JS do yt-dlp)
         run: |
-          pip install --quiet --upgrade cryptography yt-dlp pynacl
+          # Piso de versão explícito: a framework de "PO Token Providers"
+          # do yt-dlp (usada pelo bgutil) só existe a partir da release de
+          # 2025.05.22. Sem este piso, um runner que ainda tenha um yt-dlp
+          # antigo em cache pip instalava por cima com uma versão que não
+          # sabe carregar o plugin — e o yt-dlp cai silenciosamente de
+          # volta para os cookies, que é exatamente o sintoma visto em
+          # produção ("Sign in to confirm you're not a bot" mesmo com o
+          # bgutil supostamente a correr).
+          pip install --quiet --upgrade cryptography pynacl
+          pip install --quiet --upgrade "yt-dlp>=2025.05.22"
           ffmpeg -version | head -1
           yt-dlp --version
           # yt-dlp recente precisa de um runtime JS (Deno) pra gerar os
@@ -185,15 +194,32 @@ jobs:
           done
           cd - > /dev/null
 
-          # plugin do lado Python — o yt-dlp deteta e usa o servidor
-          # local sozinho, nenhuma flag extra é precisa no comando de
-          # download (ver passo "Descarregar vídeo" abaixo, inalterado).
-          pip install --quiet -U bgutil-ytdlp-pot-provider
+          # plugin do lado Python — mesma major.minor do servidor (2.x) para
+          # garantir que ambos falam o mesmo protocolo HTTP. O yt-dlp
+          # deteta e usa o servidor local sozinho; o --extractor-args no
+          # passo de download só reforça o base_url, não é estritamente
+          # necessário, mas evita qualquer surpresa caso o autodiscovery
+          # falhe (foi o que mascarou o problema em produção).
+          pip install --quiet -U "bgutil-ytdlp-pot-provider>=1.2.0"
 
       # ═══════════════════════════════════════════════════════════════════
       # DOWNLOAD — yt-dlp, único modo suportado. Seletor adaptativo (nunca
       # itag fixo — os números mudam por vídeo/qualidade disponível).
       # ═══════════════════════════════════════════════════════════════════
+
+      - name: Verificar que o plugin de PO Token foi carregado
+        # Diagnóstico curto. Se a linha "PO Token Providers" vier vazia
+        # ou só com "(none)", o download vai falhar por bot-check e o
+        # log fica explícito em vez de só aparecer o "Sign in to
+        # confirm..." mais abaixo. Não aborta o job — o download ainda
+        # pode funcionar via cookies se o plugin falhar — só avisa.
+        continue-on-error: true
+        run: |
+          echo "── yt-dlp -v --simulate (só providers) ──"
+          yt-dlp -v --simulate --skip-download \
+            "https://www.youtube.com/watch?v=K6ISaYEtDKo" 2>&1 \
+            | grep -iE "PO Token|pot|bgutil|provider" || true
+          echo "── fim do diagnóstico ──"
 
       - name: Descarregar vídeo (yt-dlp)
         env:
@@ -219,8 +245,17 @@ jobs:
           # (sem re-encode) sempre que a fonte já for h264+aac nessa
           # altura — não só "por sorte" quando a fonte calhava de já ser
           # 720/1080p.
+          #
+          # --extractor-args: fixa explicitamente o base_url do servidor
+          # bgutil local. Sem isto, o plugin tenta autodescobrir o
+          # servidor e, se falhar (porta, versão, primeira chamada antes
+          # do server estar pronto), cai silenciosamente para "sem PO
+          # Token" e o yt-dlp volta a depender só dos cookies — que é o
+          # que causou o erro "Sign in to confirm you're not a bot" em
+          # produção.
           yt-dlp \
             "${COOKIE_ARGS[@]}" \
+            --extractor-args "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416" \
             --remote-components ejs:github \
             -S "res:${MAX_H},vcodec:h264,acodec:aac,ext:mp4:m4a" \
             -f "bestvideo[height<=${MAX_H}]+bestaudio/best[height<=${MAX_H}]" \
