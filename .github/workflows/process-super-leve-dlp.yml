@@ -20,61 +20,6 @@ name: StreamVault Process (Super Leve DLP)
 # master.m3u8/nonces.json/cdn_urls.json, token de instalação da App de
 # storage, registo no EdgeOne, webhook, cleanup.
 #
-# ADICIONADO — provedor de PO Token (bgutil-ytdlp-pot-provider): o
-# YouTube passou a exigir um "Proof-of-Origin token" (gerado via o
-# BotGuard dele) pra muitos pedidos vindos de IPs de datacenter — que é
-# exatamente o caso dos runners do GitHub Actions — e sem esse token
-# aparece o erro "Sign in to confirm you're not a bot", mesmo em vídeo
-# 100% público. Antes disto, a única defesa eram os cookies passados
-# via YTDLP_COOKIES, que rodam periodicamente e exigem re-exportar do
-# browser à mão sempre que expiram de vez (não há como automatizar essa
-# parte). O bgutil resolve isso de outra forma: sobe um servidor local
-# (Node.js) que emula o BotGuard e gera o token NA HORA a cada pedido —
-# não é uma credencial estática que expira, então não há nada pra
-# renovar manualmente. Corre nativo, sem Docker (só precisa de Node.js
-# + git, que o runner já tem via actions/setup-node abaixo): sobe no
-# início do job, fica em background durante o download, e é encerrado
-# no passo de Cleanup no fim.
-#
-# O download agora tenta PRIMEIRO sem cookie nenhum (só com o PO Token
-# do bgutil) — só recorre ao cookie como fallback, e só se a falha for
-# especificamente o erro de bot-check. Isto não é cosmético: reduz o
-# desgaste real do cookie (ele deixa de ser usado em toda run, só nos
-# casos raros em que o PO Token sozinho não chega, tipicamente conteúdo
-# idade-restrito), o que deve espaçar bastante a frequência com que ele
-# expira de vez e precisa de re-exportação manual do browser. Não existe
-# hoje nenhum mecanismo (OAuth2 do yt-dlp foi desativado pela Google em
-# 2024) que elimine 100% essa manutenção manual — mas isto reduz a
-# frequência de "sempre" pra "raramente".
-#
-# DIAGNÓSTICO DO PLUGIN — o plugin bgutil-ytdlp-pot-provider já teve
-# casos reais (yt-dlp/yt-dlp#15796) de falhar ao carregar em silêncio
-# quando fica dessincronizado de uma mudança interna do yt-dlp — nesse
-# caso o download segue sem PO Token nenhum, como se o bgutil nunca
-# tivesse sido instalado, e o erro de bot-check reaparece igual a antes.
-# Por isso, logo após instalar o plugin, o passo do bgutil faz um
-# --simulate real (dispara o mesmo pedido que aciona o bot-check, mas
-# sem descarregar nada) e grava POT_PROVIDER_OK=true/false no ambiente.
-# O passo de download só força os clients "mweb" (sem cookie) / 
-# "web_safari" (com cookie) — recomendação oficial do yt-dlp PO Token
-# Guide — quando POT_PROVIDER_OK=true; caso contrário, ambos EXIGEM PO
-# Token pra funcionar, então forçá-los sem provider a funcionar de
-# verdade só pioraria as coisas — nesse caso deixa o yt-dlp escolher o
-# client por defeito, que às vezes acerta noutro que não precisa de token.
-#
-# 403 INTERMITENTE NOS FRAGMENTOS — mesmo com o PO Token Provider
-# confirmado e a passar da barreira de metadados, a YouTube pode rejeitar
-# o token gerado na hora de servir os fragmentos em si (issue
-# Brainicism/bgutil-ytdlp-pot-provider#242 — reproduzido especificamente
-# com o client web_safari). Foi corrigido na 1.3.2/2.0.0, mas descrito
-# pelos próprios mantenedores como "mitigating", não eliminando — está
-# ligado a testes A/B do lado da YouTube, portanto continua a acontecer
-# ocasionalmente mesmo com a versão corrigida. Por isso o plugin Python é
-# pinado à MESMA versão exacta do servidor (evita desalinhamento) E o
-# download tenta a mesma sessão até 3 vezes (cada tentativa nova gera um
-# visitor_data novo, que pode cair fora do bucket de A/B afetado) antes
-# de desistir dessa via ou cair pro fallback seguinte.
-#
 # contentId = sempre o video_id do YouTube (vem do metadata montado no
 # ingest/worker) — estável, nunca ambíguo.
 #
@@ -175,125 +120,6 @@ jobs:
           "$HOME/.deno/bin/deno" --version
 
       # ═══════════════════════════════════════════════════════════════════
-      # DIAGNÓSTICO — teste isolado, sem afetar o pipeline real. Corre
-      # exatamente o comando que funcionou localmente sem cookie nenhum
-      # (yt-dlp -f 230 --hls-use-mpegts), mas a partir do IP deste runner
-      # e ANTES de qualquer PO Token/cookie entrar em jogo, pra isolar
-      # de vez se o que faz a diferença é o IP (datacenter vs. residencial)
-      # ou o formato/itag em si (230 = HLS via web_safari, que segundo o
-      # PO Token Guide oficial do yt-dlp não exige PO Token pra GVS).
-      # continue-on-error: true — nunca deve travar o job, é só relatório.
-      # ═══════════════════════════════════════════════════════════════════
-
-      - name: 'DIAGNÓSTICO: itag 230 puro, sem cookie/PO Token, no IP do runner'
-        continue-on-error: true
-        env:
-          VIDEO_URL: ${{ inputs.video_url }}
-        run: |
-          echo "→ comando exacto testado localmente, agora a partir do IP deste runner:"
-          echo "  yt-dlp -f 230 --hls-use-mpegts -o diag_test.%(ext)s \"$VIDEO_URL\""
-          set +e
-          yt-dlp -f 230 --hls-use-mpegts -o /tmp/diag_test.%(ext)s "$VIDEO_URL" > /tmp/diag_230.log 2>&1
-          DIAG_STATUS=$?
-          set -e
-          cat /tmp/diag_230.log
-
-          echo "───────────────────────────────────────────────"
-          if [ "$DIAG_STATUS" -eq 0 ]; then
-            echo "✓ FUNCIONOU no IP deste runner (datacenter) — o formato 230 (HLS via web_safari) contorna o bloqueio mesmo aqui. Vale a pena forçar este formato no download real, sem precisar de PO Token nem cookie."
-          elif grep -qi "sign in to confirm\|not a bot" /tmp/diag_230.log; then
-            echo "✗ FALHOU no IP deste runner com o mesmo erro de bot-check — confirma que a causa é mesmo o IP (datacenter), não o formato/itag. O 230 só passou em casa por causa do IP residencial."
-          else
-            echo "⚠ Falhou, mas por outro motivo (não é bot-check) — ver log acima."
-          fi
-          echo "───────────────────────────────────────────────"
-          rm -f /tmp/diag_test.* 2>/dev/null || true
-
-      # ═══════════════════════════════════════════════════════════════════
-      # PO TOKEN — provedor bgutil nativo (sem Docker). Resolve o bloqueio
-      # de bot do YouTube sem depender de cookies renovados à mão (ver
-      # comentário no topo do ficheiro). Precisa de subir ANTES do passo
-      # de download, e fica vivo em background até o Cleanup no fim.
-      # ═══════════════════════════════════════════════════════════════════
-
-      - name: Instalar Node.js para o provedor de PO Token (bgutil)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Subir provedor de PO Token (bgutil) — nativo, sem Docker
-        run: |
-          BGUTIL_VERSION="2.0.0"
-          BGUTIL_DIR="/tmp/bgutil-ytdlp-pot-provider"
-
-          # servidor em si (gera o PO Token emulando o BotGuard do
-          # YouTube) — só Node.js + git, ambos já disponíveis no runner
-          # (Node via actions/setup-node acima).
-          git clone --quiet --single-branch --branch "$BGUTIL_VERSION" \
-            https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git "$BGUTIL_DIR"
-          cd "$BGUTIL_DIR/server"
-          npm ci --silent
-          npx tsc
-
-          # arranca em background — este processo tem de continuar vivo
-          # durante o resto do job; é encerrado no passo de Cleanup.
-          nohup node build/main.js > /tmp/bgutil-server.log 2>&1 &
-          echo $! > /tmp/bgutil-server.pid
-
-          # espera a porta 4416 responder (até 20s) antes de seguir — sem
-          # isto, o primeiro pedido do yt-dlp pode chegar antes do
-          # servidor estar pronto. Testa só a porta (sem assumir nenhum
-          # endpoint HTTP específico).
-          for i in $(seq 1 20); do
-            if (echo > /dev/tcp/127.0.0.1/4416) 2>/dev/null; then
-              echo "✓ Servidor bgutil a responder na porta 4416 (tentativa ${i})"
-              break
-            fi
-            if [ "$i" -eq 20 ]; then
-              echo "⚠ Servidor bgutil não respondeu em 20s — log:"
-              cat /tmp/bgutil-server.log 2>/dev/null || true
-            fi
-            sleep 1
-          done
-          cd - > /dev/null
-
-          # plugin do lado Python — pinado à MESMA versão do servidor
-          # (2.0.0, definida em BGUTIL_VERSION acima) de propósito: um
-          # desalinhamento de versão entre plugin e servidor já causou
-          # falhas silenciosas noutros projetos que usam isto. Nada de
-          # "-U" cego aqui.
-          pip install --quiet "bgutil-ytdlp-pot-provider==${BGUTIL_VERSION}"
-
-          echo "→ versões em uso:"
-          echo "  servidor (package.json): $(node -p "require('$BGUTIL_DIR/server/package.json').version" 2>/dev/null || echo '?')"
-          echo "  plugin (pip):            $(pip show bgutil-ytdlp-pot-provider 2>/dev/null | grep -i '^Version' || echo '?')"
-
-          # DIAGNÓSTICO — sem isto, uma falha de compatibilidade entre a
-          # versão do yt-dlp e a versão do plugin (já aconteceu: issue
-          # yt-dlp/yt-dlp#15796, "ImportError: cannot import name
-          # 'select_proxy'") passa em SILÊNCIO — o yt-dlp simplesmente
-          # segue sem PO Token nenhum e o erro de bot-check reaparece
-          # como se o bgutil nunca tivesse sido instalado. --simulate
-          # não descarrega nada, só faz o pedido real que dispara o
-          # bot-check, então confirma o estado de verdade.
-          echo "→ a verificar se o yt-dlp enxerga o PO Token Provider..."
-          yt-dlp -v --simulate --skip-download \
-            --extractor-args "youtube:player_client=mweb" \
-            "${{ inputs.video_url }}" > /tmp/bgutil_check.log 2>&1 || true
-
-          if grep -qi "error while importing module" /tmp/bgutil_check.log; then
-            echo "✗ Plugin bgutil falhou ao carregar (incompatibilidade de versão yt-dlp ↔ bgutil-ytdlp-pot-provider):"
-            grep -A3 -i "error while importing module" /tmp/bgutil_check.log || true
-            echo "POT_PROVIDER_OK=false" >> $GITHUB_ENV
-          elif grep -qi "pot" /tmp/bgutil_check.log; then
-            echo "✓ PO Token Provider detectado e activo"
-            echo "POT_PROVIDER_OK=true" >> $GITHUB_ENV
-          else
-            echo "⚠ Não deu pra confirmar o PO Token Provider no output verbose — a seguir sem forçar player_client"
-            echo "POT_PROVIDER_OK=false" >> $GITHUB_ENV
-          fi
-
-      # ═══════════════════════════════════════════════════════════════════
       # DOWNLOAD — yt-dlp, único modo suportado. Seletor adaptativo (nunca
       # itag fixo — os números mudam por vídeo/qualidade disponível).
       # ═══════════════════════════════════════════════════════════════════
@@ -301,18 +127,14 @@ jobs:
       - name: Descarregar vídeo (yt-dlp)
         env:
           VIDEO_URL: ${{ inputs.video_url }}
-          # Cookie deixa de ser usado em TODA run (ver lógica de duas
-          # tentativas abaixo) — só entra em jogo se a 1ª tentativa (só
-          # com o PO Token do bgutil) falhar especificamente com o erro
-          # de bot-check. Isso reduz drasticamente o desgaste do cookie:
-          # ele só é "usado de verdade" nos casos raros em que o PO
-          # Token sozinho não chega (ex.: conteúdo idade-restrito), em
-          # vez de em cada job — o que era o que fazia a sessão rodar
-          # mais depressa antes.
+          # Opcional: cookies de sessão em formato Netscape, se o canal
+          # tiver conteúdo idade-restrita ou o runner começar a levar 429.
           YTDLP_COOKIES: ${{ secrets.YTDLP_COOKIES }}
         run: |
+          COOKIE_ARGS=()
           if [ -n "$YTDLP_COOKIES" ]; then
             echo "$YTDLP_COOKIES" > /tmp/cookies.txt
+            COOKIE_ARGS=(--cookies /tmp/cookies.txt)
           fi
 
           # -S (sort) usa o MESMO $MAX_H que já vem do input
@@ -323,102 +145,18 @@ jobs:
           # (sem re-encode) sempre que a fonte já for h264+aac nessa
           # altura — não só "por sorte" quando a fonte calhava de já ser
           # 720/1080p.
-          YTDLP_COMMON=(
-            --remote-components ejs:github
-            -S "res:${MAX_H},vcodec:h264,acodec:aac,ext:mp4:m4a"
-            -f "bestvideo[height<=${MAX_H}]+bestaudio/best[height<=${MAX_H}]"
-            --merge-output-format mp4
-            --retries 5
-            --fragment-retries 5
-            --sleep-requests 1
-            --no-playlist
-            -o "$WORK_DIR/incoming/input.%(ext)s"
-          )
-
-          # Client forçado só se o diagnóstico do passo anterior confirmou
-          # que o PO Token Provider está mesmo activo — o guia oficial do
-          # yt-dlp recomenda "mweb" sem cookies e "web_safari" com cookies
-          # PORQUE ambos exigem PO Token pra funcionar; forçá-los sem um
-          # provider a funcionar de verdade seria piorar as coisas, não
-          # ajudar (deixamos o yt-dlp escolher o client default, que às
-          # vezes acerta noutro client que não exige PO Token nenhum).
-          CLIENT_ARGS_NOCOOKIE=()
-          CLIENT_ARGS_COOKIE=()
-          if [ "${POT_PROVIDER_OK:-false}" = "true" ]; then
-            CLIENT_ARGS_NOCOOKIE=(--extractor-args "youtube:player_client=mweb")
-            CLIENT_ARGS_COOKIE=(--extractor-args "youtube:player_client=web_safari")
-            echo "→ PO Token Provider confirmado — a forçar mweb (sem cookie) / web_safari (com cookie)"
-          else
-            echo "⚠ PO Token Provider não confirmado nesta run — a deixar o yt-dlp escolher o client por defeito"
-          fi
-
-          # RETRY DE SESSÃO — o token GVS gerado pelo bgutil é
-          # ocasionalmente rejeitado pela YouTube com 403 nos fragmentos,
-          # mesmo com manifesto e player API já aceites (issue
-          # Brainicism/bgutil-ytdlp-pot-provider#242 — corrigido na
-          # 1.3.2/2.0.0, mas descrito como "mitigating", não eliminando,
-          # porque depende de testes A/B do lado da YouTube). Uma sessão
-          # NOVA (novo processo yt-dlp = novo visitor_data) pode cair
-          # noutro bucket de A/B e simplesmente funcionar — daí repetir a
-          # MESMA tentativa (mesmo client) algumas vezes antes de desistir
-          # ou cair pro fallback seguinte, em vez de só confiar no retry
-          # de fragmento individual (--fragment-retries), que não ajuda
-          # quando é o token inteiro que está a ser rejeitado.
-          YTDLP_SESSION_RETRIES=3
-
-          attempt_download() {
-            local label="$1"; shift
-            local n=1
-            while [ "$n" -le "$YTDLP_SESSION_RETRIES" ]; do
-              echo "→ ${label} — sessão ${n}/${YTDLP_SESSION_RETRIES}"
-              rm -f "$WORK_DIR/incoming"/* 2>/dev/null || true
-              yt-dlp "$@" "${YTDLP_COMMON[@]}" "$VIDEO_URL" 2>&1 | tee /tmp/ytdlp_last.log
-              local status=${PIPESTATUS[0]}
-              if [ "$status" -eq 0 ]; then
-                echo "✓ ${label} — sucesso na sessão ${n}"
-                return 0
-              fi
-              if grep -qi "HTTP Error 403" /tmp/ytdlp_last.log; then
-                echo "⚠ ${label} — 403 nos fragmentos (rejeição intermitente de token, bgutil#242) — nova sessão a seguir"
-              elif grep -qi "sign in to confirm\|not a bot" /tmp/ytdlp_last.log; then
-                echo "⚠ ${label} — erro de bot-check"
-                return 2
-              else
-                echo "✗ ${label} — falhou por outro motivo (não é 403 nem bot-check)"
-                return 3
-              fi
-              n=$((n+1))
-              sleep 5
-            done
-            return 1
-          }
-
-          set +e
-          attempt_download "tentativa 1 (sem cookies)" "${CLIENT_ARGS_NOCOOKIE[@]}"
-          RESULT1=$?
-          set -e
-
-          if [ "$RESULT1" -ne 0 ]; then
-            if [ "$RESULT1" -eq 3 ]; then
-              echo "✗ Tentativa 1 falhou por motivo não relacionado a bot-check/403 — ver log acima, não adianta cair pra cookies"
-              exit 1
-            fi
-            if [ -z "$YTDLP_COOKIES" ]; then
-              echo "✗ Tentativa 1 esgotou as sessões e não há YTDLP_COOKIES configurado pra fallback"
-              exit 1
-            fi
-            echo "⚠ Tentativa 1 esgotou as sessões — a cair para cookies (fallback)"
-            set +e
-            attempt_download "tentativa 2 (com cookies)" --cookies /tmp/cookies.txt "${CLIENT_ARGS_COOKIE[@]}"
-            RESULT2=$?
-            set -e
-            if [ "$RESULT2" -ne 0 ]; then
-              echo "✗ Tentativa 2 (com cookies) também esgotou as sessões — a desistir"
-              exit 1
-            fi
-          else
-            echo "✓ Sucesso sem cookies — sessão de cookies preservada, não foi tocada"
-          fi
+          yt-dlp \
+            "${COOKIE_ARGS[@]}" \
+            --remote-components ejs:github \
+            -S "res:${MAX_H},vcodec:h264,acodec:aac,ext:mp4:m4a" \
+            -f "bestvideo[height<=${MAX_H}]+bestaudio/best[height<=${MAX_H}]" \
+            --merge-output-format mp4 \
+            --retries 5 \
+            --fragment-retries 5 \
+            --sleep-requests 1 \
+            --no-playlist \
+            -o "$WORK_DIR/incoming/input.%(ext)s" \
+            "$VIDEO_URL"
 
           VIDEO_PATH=$(find "$WORK_DIR/incoming/" -type f | head -1)
           if [ -z "$VIDEO_PATH" ]; then
@@ -440,14 +178,8 @@ jobs:
         # de ser refeito à mão sempre que isso acontece. Não elimina a
         # necessidade de login manual por completo — só torna raro (o
         # Google ainda pode forçar reautenticação por deteção de anomalia
-        # ou inatividade prolongada), mas resolve o caso comum. Com o
-        # PO Token (bgutil, acima) a assumir a parte principal do
-        # anti-bot, este passo passa a ser um extra, não a única rede de
-        # segurança. Corre com always() porque o cookie agora só é usado
-        # como fallback (ver passo de download) — mesmo quando a run
-        # falha por outro motivo, se o yt-dlp chegou a tocar no cookie e
-        # renová-lo, vale a pena guardar isso antes que expire de vez.
-        if: always() && env.YTDLP_COOKIES != ''
+        # ou inatividade prolongada), mas resolve o caso comum.
+        if: env.YTDLP_COOKIES != ''
         continue-on-error: true
         env:
           SECRETS_UPDATE_PAT: ${{ secrets.SECRETS_UPDATE_PAT }}
@@ -1093,10 +825,4 @@ jobs:
           rm -rf "$WORK_DIR"
           rm -rf /tmp/shard
           rm -f /tmp/wh_resp.txt /tmp/cookies.txt
-          # encerra o servidor de PO Token (bgutil), se ainda estiver vivo
-          if [ -f /tmp/bgutil-server.pid ]; then
-            kill "$(cat /tmp/bgutil-server.pid)" 2>/dev/null || true
-            rm -f /tmp/bgutil-server.pid /tmp/bgutil-server.log
-          fi
-          rm -rf /tmp/bgutil-ytdlp-pot-provider
           echo "✓ Workspace limpo"
