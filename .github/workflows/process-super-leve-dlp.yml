@@ -47,6 +47,21 @@ name: StreamVault Process (Super Leve DLP)
 # 2024) que elimine 100% essa manutenção manual — mas isto reduz a
 # frequência de "sempre" pra "raramente".
 #
+# DIAGNÓSTICO DO PLUGIN — o plugin bgutil-ytdlp-pot-provider já teve
+# casos reais (yt-dlp/yt-dlp#15796) de falhar ao carregar em silêncio
+# quando fica dessincronizado de uma mudança interna do yt-dlp — nesse
+# caso o download segue sem PO Token nenhum, como se o bgutil nunca
+# tivesse sido instalado, e o erro de bot-check reaparece igual a antes.
+# Por isso, logo após instalar o plugin, o passo do bgutil faz um
+# --simulate real (dispara o mesmo pedido que aciona o bot-check, mas
+# sem descarregar nada) e grava POT_PROVIDER_OK=true/false no ambiente.
+# O passo de download só força os clients "mweb" (sem cookie) / 
+# "web_safari" (com cookie) — recomendação oficial do yt-dlp PO Token
+# Guide — quando POT_PROVIDER_OK=true; caso contrário, ambos EXIGEM PO
+# Token pra funcionar, então forçá-los sem provider a funcionar de
+# verdade só pioraria as coisas — nesse caso deixa o yt-dlp escolher o
+# client por defeito, que às vezes acerta noutro que não precisa de token.
+#
 # contentId = sempre o video_id do YouTube (vem do metadata montado no
 # ingest/worker) — estável, nunca ambíguo.
 #
@@ -196,8 +211,33 @@ jobs:
 
           # plugin do lado Python — o yt-dlp deteta e usa o servidor
           # local sozinho, nenhuma flag extra é precisa no comando de
-          # download (ver passo "Descarregar vídeo" abaixo, inalterado).
+          # download (ver passo "Descarregar vídeo" abaixo).
           pip install --quiet -U bgutil-ytdlp-pot-provider
+
+          # DIAGNÓSTICO — sem isto, uma falha de compatibilidade entre a
+          # versão do yt-dlp e a versão do plugin (já aconteceu: issue
+          # yt-dlp/yt-dlp#15796, "ImportError: cannot import name
+          # 'select_proxy'") passa em SILÊNCIO — o yt-dlp simplesmente
+          # segue sem PO Token nenhum e o erro de bot-check reaparece
+          # como se o bgutil nunca tivesse sido instalado. --simulate
+          # não descarrega nada, só faz o pedido real que dispara o
+          # bot-check, então confirma o estado de verdade.
+          echo "→ a verificar se o yt-dlp enxerga o PO Token Provider..."
+          yt-dlp -v --simulate --skip-download \
+            --extractor-args "youtube:player_client=mweb" \
+            "${{ inputs.video_url }}" > /tmp/bgutil_check.log 2>&1 || true
+
+          if grep -qi "error while importing module" /tmp/bgutil_check.log; then
+            echo "✗ Plugin bgutil falhou ao carregar (incompatibilidade de versão yt-dlp ↔ bgutil-ytdlp-pot-provider):"
+            grep -A3 -i "error while importing module" /tmp/bgutil_check.log || true
+            echo "POT_PROVIDER_OK=false" >> $GITHUB_ENV
+          elif grep -qi "pot" /tmp/bgutil_check.log; then
+            echo "✓ PO Token Provider detectado e activo"
+            echo "POT_PROVIDER_OK=true" >> $GITHUB_ENV
+          else
+            echo "⚠ Não deu pra confirmar o PO Token Provider no output verbose — a seguir sem forçar player_client"
+            echo "POT_PROVIDER_OK=false" >> $GITHUB_ENV
+          fi
 
       # ═══════════════════════════════════════════════════════════════════
       # DOWNLOAD — yt-dlp, único modo suportado. Seletor adaptativo (nunca
@@ -241,16 +281,33 @@ jobs:
             -o "$WORK_DIR/incoming/input.%(ext)s"
           )
 
+          # Client forçado só se o diagnóstico do passo anterior confirmou
+          # que o PO Token Provider está mesmo activo — o guia oficial do
+          # yt-dlp recomenda "mweb" sem cookies e "web_safari" com cookies
+          # PORQUE ambos exigem PO Token pra funcionar; forçá-los sem um
+          # provider a funcionar de verdade seria piorar as coisas, não
+          # ajudar (deixamos o yt-dlp escolher o client default, que às
+          # vezes acerta noutro client que não exige PO Token nenhum).
+          CLIENT_ARGS_NOCOOKIE=()
+          CLIENT_ARGS_COOKIE=()
+          if [ "${POT_PROVIDER_OK:-false}" = "true" ]; then
+            CLIENT_ARGS_NOCOOKIE=(--extractor-args "youtube:player_client=mweb")
+            CLIENT_ARGS_COOKIE=(--extractor-args "youtube:player_client=web_safari")
+            echo "→ PO Token Provider confirmado — a forçar mweb (sem cookie) / web_safari (com cookie)"
+          else
+            echo "⚠ PO Token Provider não confirmado nesta run — a deixar o yt-dlp escolher o client por defeito"
+          fi
+
           echo "→ tentativa 1: sem cookies (só PO Token via bgutil)"
           set +e
-          yt-dlp "${YTDLP_COMMON[@]}" "$VIDEO_URL" 2>&1 | tee /tmp/ytdlp_attempt1.log
+          yt-dlp "${CLIENT_ARGS_NOCOOKIE[@]}" "${YTDLP_COMMON[@]}" "$VIDEO_URL" 2>&1 | tee /tmp/ytdlp_attempt1.log
           STATUS1=${PIPESTATUS[0]}
           set -e
 
           if [ "$STATUS1" -ne 0 ]; then
             if grep -qi "sign in to confirm\|not a bot" /tmp/ytdlp_attempt1.log && [ -n "$YTDLP_COOKIES" ]; then
               echo "⚠ Tentativa 1 falhou com erro de bot-check — repetindo com cookies (fallback)"
-              yt-dlp --cookies /tmp/cookies.txt "${YTDLP_COMMON[@]}" "$VIDEO_URL"
+              yt-dlp --cookies /tmp/cookies.txt "${CLIENT_ARGS_COOKIE[@]}" "${YTDLP_COMMON[@]}" "$VIDEO_URL"
             elif grep -qi "sign in to confirm\|not a bot" /tmp/ytdlp_attempt1.log; then
               echo "✗ Falhou com erro de bot-check e não há YTDLP_COOKIES configurado pra fallback"
               exit 1
