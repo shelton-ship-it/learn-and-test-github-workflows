@@ -62,6 +62,19 @@ name: StreamVault Process (Super Leve DLP)
 # verdade só pioraria as coisas — nesse caso deixa o yt-dlp escolher o
 # client por defeito, que às vezes acerta noutro que não precisa de token.
 #
+# 403 INTERMITENTE NOS FRAGMENTOS — mesmo com o PO Token Provider
+# confirmado e a passar da barreira de metadados, a YouTube pode rejeitar
+# o token gerado na hora de servir os fragmentos em si (issue
+# Brainicism/bgutil-ytdlp-pot-provider#242 — reproduzido especificamente
+# com o client web_safari). Foi corrigido na 1.3.2/2.0.0, mas descrito
+# pelos próprios mantenedores como "mitigating", não eliminando — está
+# ligado a testes A/B do lado da YouTube, portanto continua a acontecer
+# ocasionalmente mesmo com a versão corrigida. Por isso o plugin Python é
+# pinado à MESMA versão exacta do servidor (evita desalinhamento) E o
+# download tenta a mesma sessão até 3 vezes (cada tentativa nova gera um
+# visitor_data novo, que pode cair fora do bucket de A/B afetado) antes
+# de desistir dessa via ou cair pro fallback seguinte.
+#
 # contentId = sempre o video_id do YouTube (vem do metadata montado no
 # ingest/worker) — estável, nunca ambíguo.
 #
@@ -162,6 +175,41 @@ jobs:
           "$HOME/.deno/bin/deno" --version
 
       # ═══════════════════════════════════════════════════════════════════
+      # DIAGNÓSTICO — teste isolado, sem afetar o pipeline real. Corre
+      # exatamente o comando que funcionou localmente sem cookie nenhum
+      # (yt-dlp -f 230 --hls-use-mpegts), mas a partir do IP deste runner
+      # e ANTES de qualquer PO Token/cookie entrar em jogo, pra isolar
+      # de vez se o que faz a diferença é o IP (datacenter vs. residencial)
+      # ou o formato/itag em si (230 = HLS via web_safari, que segundo o
+      # PO Token Guide oficial do yt-dlp não exige PO Token pra GVS).
+      # continue-on-error: true — nunca deve travar o job, é só relatório.
+      # ═══════════════════════════════════════════════════════════════════
+
+      - name: 'DIAGNÓSTICO: itag 230 puro, sem cookie/PO Token, no IP do runner'
+        continue-on-error: true
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          echo "→ comando exacto testado localmente, agora a partir do IP deste runner:"
+          echo "  yt-dlp -f 230 --hls-use-mpegts -o diag_test.%(ext)s \"$VIDEO_URL\""
+          set +e
+          yt-dlp -f 230 --hls-use-mpegts -o /tmp/diag_test.%(ext)s "$VIDEO_URL" > /tmp/diag_230.log 2>&1
+          DIAG_STATUS=$?
+          set -e
+          cat /tmp/diag_230.log
+
+          echo "───────────────────────────────────────────────"
+          if [ "$DIAG_STATUS" -eq 0 ]; then
+            echo "✓ FUNCIONOU no IP deste runner (datacenter) — o formato 230 (HLS via web_safari) contorna o bloqueio mesmo aqui. Vale a pena forçar este formato no download real, sem precisar de PO Token nem cookie."
+          elif grep -qi "sign in to confirm\|not a bot" /tmp/diag_230.log; then
+            echo "✗ FALHOU no IP deste runner com o mesmo erro de bot-check — confirma que a causa é mesmo o IP (datacenter), não o formato/itag. O 230 só passou em casa por causa do IP residencial."
+          else
+            echo "⚠ Falhou, mas por outro motivo (não é bot-check) — ver log acima."
+          fi
+          echo "───────────────────────────────────────────────"
+          rm -f /tmp/diag_test.* 2>/dev/null || true
+
+      # ═══════════════════════════════════════════════════════════════════
       # PO TOKEN — provedor bgutil nativo (sem Docker). Resolve o bloqueio
       # de bot do YouTube sem depender de cookies renovados à mão (ver
       # comentário no topo do ficheiro). Precisa de subir ANTES do passo
@@ -209,10 +257,16 @@ jobs:
           done
           cd - > /dev/null
 
-          # plugin do lado Python — o yt-dlp deteta e usa o servidor
-          # local sozinho, nenhuma flag extra é precisa no comando de
-          # download (ver passo "Descarregar vídeo" abaixo).
-          pip install --quiet -U bgutil-ytdlp-pot-provider
+          # plugin do lado Python — pinado à MESMA versão do servidor
+          # (2.0.0, definida em BGUTIL_VERSION acima) de propósito: um
+          # desalinhamento de versão entre plugin e servidor já causou
+          # falhas silenciosas noutros projetos que usam isto. Nada de
+          # "-U" cego aqui.
+          pip install --quiet "bgutil-ytdlp-pot-provider==${BGUTIL_VERSION}"
+
+          echo "→ versões em uso:"
+          echo "  servidor (package.json): $(node -p "require('$BGUTIL_DIR/server/package.json').version" 2>/dev/null || echo '?')"
+          echo "  plugin (pip):            $(pip show bgutil-ytdlp-pot-provider 2>/dev/null | grep -i '^Version' || echo '?')"
 
           # DIAGNÓSTICO — sem isto, uma falha de compatibilidade entre a
           # versão do yt-dlp e a versão do plugin (já aconteceu: issue
@@ -298,21 +352,68 @@ jobs:
             echo "⚠ PO Token Provider não confirmado nesta run — a deixar o yt-dlp escolher o client por defeito"
           fi
 
-          echo "→ tentativa 1: sem cookies (só PO Token via bgutil)"
+          # RETRY DE SESSÃO — o token GVS gerado pelo bgutil é
+          # ocasionalmente rejeitado pela YouTube com 403 nos fragmentos,
+          # mesmo com manifesto e player API já aceites (issue
+          # Brainicism/bgutil-ytdlp-pot-provider#242 — corrigido na
+          # 1.3.2/2.0.0, mas descrito como "mitigating", não eliminando,
+          # porque depende de testes A/B do lado da YouTube). Uma sessão
+          # NOVA (novo processo yt-dlp = novo visitor_data) pode cair
+          # noutro bucket de A/B e simplesmente funcionar — daí repetir a
+          # MESMA tentativa (mesmo client) algumas vezes antes de desistir
+          # ou cair pro fallback seguinte, em vez de só confiar no retry
+          # de fragmento individual (--fragment-retries), que não ajuda
+          # quando é o token inteiro que está a ser rejeitado.
+          YTDLP_SESSION_RETRIES=3
+
+          attempt_download() {
+            local label="$1"; shift
+            local n=1
+            while [ "$n" -le "$YTDLP_SESSION_RETRIES" ]; do
+              echo "→ ${label} — sessão ${n}/${YTDLP_SESSION_RETRIES}"
+              rm -f "$WORK_DIR/incoming"/* 2>/dev/null || true
+              yt-dlp "$@" "${YTDLP_COMMON[@]}" "$VIDEO_URL" 2>&1 | tee /tmp/ytdlp_last.log
+              local status=${PIPESTATUS[0]}
+              if [ "$status" -eq 0 ]; then
+                echo "✓ ${label} — sucesso na sessão ${n}"
+                return 0
+              fi
+              if grep -qi "HTTP Error 403" /tmp/ytdlp_last.log; then
+                echo "⚠ ${label} — 403 nos fragmentos (rejeição intermitente de token, bgutil#242) — nova sessão a seguir"
+              elif grep -qi "sign in to confirm\|not a bot" /tmp/ytdlp_last.log; then
+                echo "⚠ ${label} — erro de bot-check"
+                return 2
+              else
+                echo "✗ ${label} — falhou por outro motivo (não é 403 nem bot-check)"
+                return 3
+              fi
+              n=$((n+1))
+              sleep 5
+            done
+            return 1
+          }
+
           set +e
-          yt-dlp "${CLIENT_ARGS_NOCOOKIE[@]}" "${YTDLP_COMMON[@]}" "$VIDEO_URL" 2>&1 | tee /tmp/ytdlp_attempt1.log
-          STATUS1=${PIPESTATUS[0]}
+          attempt_download "tentativa 1 (sem cookies)" "${CLIENT_ARGS_NOCOOKIE[@]}"
+          RESULT1=$?
           set -e
 
-          if [ "$STATUS1" -ne 0 ]; then
-            if grep -qi "sign in to confirm\|not a bot" /tmp/ytdlp_attempt1.log && [ -n "$YTDLP_COOKIES" ]; then
-              echo "⚠ Tentativa 1 falhou com erro de bot-check — repetindo com cookies (fallback)"
-              yt-dlp --cookies /tmp/cookies.txt "${CLIENT_ARGS_COOKIE[@]}" "${YTDLP_COMMON[@]}" "$VIDEO_URL"
-            elif grep -qi "sign in to confirm\|not a bot" /tmp/ytdlp_attempt1.log; then
-              echo "✗ Falhou com erro de bot-check e não há YTDLP_COOKIES configurado pra fallback"
+          if [ "$RESULT1" -ne 0 ]; then
+            if [ "$RESULT1" -eq 3 ]; then
+              echo "✗ Tentativa 1 falhou por motivo não relacionado a bot-check/403 — ver log acima, não adianta cair pra cookies"
               exit 1
-            else
-              echo "✗ yt-dlp falhou por outro motivo (não é bot-check) — ver log acima"
+            fi
+            if [ -z "$YTDLP_COOKIES" ]; then
+              echo "✗ Tentativa 1 esgotou as sessões e não há YTDLP_COOKIES configurado pra fallback"
+              exit 1
+            fi
+            echo "⚠ Tentativa 1 esgotou as sessões — a cair para cookies (fallback)"
+            set +e
+            attempt_download "tentativa 2 (com cookies)" --cookies /tmp/cookies.txt "${CLIENT_ARGS_COOKIE[@]}"
+            RESULT2=$?
+            set -e
+            if [ "$RESULT2" -ne 0 ]; then
+              echo "✗ Tentativa 2 (com cookies) também esgotou as sessões — a desistir"
               exit 1
             fi
           else
