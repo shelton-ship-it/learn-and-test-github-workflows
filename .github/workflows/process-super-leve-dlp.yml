@@ -27,6 +27,56 @@ name: StreamVault Process (Super Leve DLP)
 # yt-dlp já chama ffmpeg quando os streams vêm separados) → se a fonte
 # já estiver em HLS/codec compatível, sem re-encode — só o probe abaixo
 # decide isso, igual já decidia pra fontes h264 de torrent.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# RONDA "TIPOS + PLAYLIST" (esta edição) — MISSÃO 1 E 2, resumo:
+#
+# MISSÃO 1 — tipos do process-leve passam a ser aceites aqui também
+# (metadata.type): 'movie', 'documentary', 'dorama' (rótulo "Animações"),
+# 'series', 'anime' — somam-se aos já existentes 'rain'/'relaxation'/
+# 'ai'/'other'. O registo no EdgeOne já gravava `type` genericamente
+# (metadata.get('type','video')) — nada mudou aí. O que muda é só COMO
+# cada tipo é despachado (missão 2), e o suporte disso em ingest/worker/
+# dispatcher-novo.js pra esses tipos chegarem até aqui.
+#
+# MISSÃO 2 — regra de despacho por tipo, decidida DENTRO deste próprio
+# job (sem Coordinator novo, sem job separado):
+#   - movie / documentary / dorama / rain / relaxation / ai / other →
+#     tipo "video": 1 link = 1 vídeo = 1 job. Pipeline de sempre,
+#     LITERALMENTE INALTERADO (todos os steps antigos só ganharam
+#     `if: env.IS_PLAYLIST != 'true'`, que resolve pra 'true' == false
+#     pra estes tipos, ou seja, corre exactamente como antes).
+#   - anime → link lógico = URL de PLAYLIST do YouTube. 1 job baixa e
+#     processa a playlist INTEIRA, na ordem que o próprio yt-dlp já
+#     lista (playlist_index), sem Coordinator, sem separar em vários
+#     jobs.
+#   - series → mesma URL de playlist, mas sonda antes (--flat-playlist
+#     --print, mesmo comando indicado) e decide quantos vídeos cabem
+#     NESTE job (mesmo cálculo/tecto do Coordinator do process-leve.yml:
+#     filesize*0.55*1.17, tecto de 1400MB) — o resto fica em fila no
+#     PRÓPRIO mecanismo do lote F (POST /upload-event no worker do lote,
+#     já existente), respeitando as janelas normais de disparo. A
+#     playlist só é dada por concluída quando o último batch enfileirado
+#     tiver corrido.
+#
+# Novo input do workflow_dispatch: `playlist_items` (yt-dlp
+# --playlist-items) — vazio = decidir agora (série) ou playlist inteira
+# (anime); preenchido = job já sabe o range dele (veio de um batch
+# enfileirado). 8 inputs no total — dentro do limite rígido de 10 do
+# GitHub (confirmado por pesquisa, ver histórico do process-leve.yml).
+#
+# Numeração de episódio: usa o `playlist_index` real do próprio yt-dlp
+# (posição verdadeira na playlist) — nunca precisou de campo de offset
+# novo, porque `--playlist-items N-M` preserva o índice real dos itens
+# seleccionados, mesmo quando só uma fatia é baixada num job.
+#
+# ÚNICA COISA NÃO 100% "sem env novo": pra este job conseguir enfileirar
+# os batches restantes de uma série no lote F, precisa de saber o URL do
+# Worker (Cloudflare) e a MESMA chave que o ingest-novo.js já usa (hoje
+# hardcoded lá como WORKER_BASE/WORKER_KEY) — não é uma credencial nova,
+# é a MESMA que já existe, só que agora também precisa de chegar até
+# aqui como secret do repo (LOTE_F_WORKER_BASE / LOTE_F_WORKER_KEY).
+# Sinalizado explicitamente ao user — não inventado, só replicado.
 # ═══════════════════════════════════════════════════════════════════════
 
 on:
@@ -36,7 +86,7 @@ on:
         description: 'Job ID'
         required: true
       video_url:
-        description: 'URL do vídeo no YouTube'
+        description: 'URL do vídeo no YouTube (ou de playlist, para anime/series)'
         required: true
       seg_duration:
         description: 'Duração segmento HLS (segundos)'
@@ -58,6 +108,10 @@ on:
         description: 'Teto do job. Vídeos deste catálogo variam de poucos minutos a 10h+ — o ganho de velocidade do yt-dlp/stream-copy só cobre o encode; download+push de um vídeo longo ainda domina o tempo total independentemente disso. Default cobre a maioria; pra vídeos muito longos, definir manualmente um valor maior ao enfileirar (sem lookup automático de duração — nenhuma API nova foi adicionada só pra isso).'
         required: false
         default: '60'
+      playlist_items:
+        description: 'yt-dlp --playlist-items (uso interno série/anime). Vazio = decidir agora (série) ou playlist inteira (anime); preenchido = job já é um batch com range definido.'
+        required: false
+        default: ''
 
 jobs:
   process:
@@ -120,11 +174,176 @@ jobs:
           "$HOME/.deno/bin/deno" --version
 
       # ═══════════════════════════════════════════════════════════════════
-      # DOWNLOAD — yt-dlp, único modo suportado. Seletor adaptativo (nunca
-      # itag fixo — os números mudam por vídeo/qualidade disponível).
+      # MISSÃO 2 — decide se este job é "vídeo único" (movie/documentary/
+      # dorama/rain/relaxation/ai/other) ou "playlist" (anime/series), e,
+      # se for série, decide também QUANTOS itens cabem neste job e
+      # enfileira o resto no lote F. Roda ANTES do download — tudo que
+      # vem depois só lê IS_PLAYLIST/PLAYLIST_ITEMS_EFFECTIVE, escritos
+      # aqui.
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Detectar playlist e decidir batch (série/anime)
+        env:
+          VIDEO_URL:            ${{ inputs.video_url }}
+          INPUT_METADATA:       ${{ inputs.metadata }}
+          INPUT_PLAYLIST_ITEMS: ${{ inputs.playlist_items }}
+          INPUT_THUMBNAIL_URL:  ${{ inputs.thumbnail_url }}
+          YTDLP_COOKIES:        ${{ secrets.YTDLP_COOKIES }}
+          # MESMA credencial que o ingest-novo.js já usa (hardcoded lá
+          # como WORKER_BASE/WORKER_KEY) pra falar com o worker do lote F
+          # — replicada aqui como secret do repo, não inventada. Ver nota
+          # no cabeçalho do ficheiro.
+          LOTE_F_WORKER_BASE:   ${{ secrets.LOTE_F_WORKER_BASE }}
+          LOTE_F_WORKER_KEY:    ${{ secrets.LOTE_F_WORKER_KEY }}
+        run: |
+          if [ -n "$YTDLP_COOKIES" ]; then
+            echo "$YTDLP_COOKIES" > /tmp/cookies.txt
+          fi
+
+          python3 << 'PYEOF'
+          import os, json, subprocess, urllib.request
+
+          try:    metadata = json.loads(os.environ.get('INPUT_METADATA', '') or '{}')
+          except: metadata = {}
+          content_type   = (metadata.get('type') or 'video').strip().lower()
+          job_id         = os.environ['JOB_ID']
+          video_url      = os.environ['VIDEO_URL']
+          explicit_items = os.environ.get('INPUT_PLAYLIST_ITEMS', '').strip()
+
+          def write_env(d):
+            with open(os.environ['GITHUB_ENV'], 'a') as f:
+              for k, v in d.items():
+                f.write(f"{k}={v}\n")
+
+          # Qualquer tipo que não seja anime/series segue a regra "video":
+          # 1 link = 1 vídeo = 1 job — pipeline de sempre, sem tocar em
+          # nada. Cobre movie/documentary/dorama e os tipos antigos
+          # (rain/relaxation/ai/other).
+          if content_type not in ('anime', 'series'):
+            write_env({'IS_PLAYLIST': 'false', 'PLAYLIST_ITEMS_EFFECTIVE': ''})
+            print(f"→ type={content_type}: fluxo de vídeo único (sem playlist) — pipeline inalterado")
+            raise SystemExit(0)
+
+          write_env({'IS_PLAYLIST': 'true'})
+
+          # Job já chegou com o range dele definido — é um batch de série
+          # já enfileirado (ou uma continuação); não sonda de novo.
+          if explicit_items:
+            write_env({'PLAYLIST_ITEMS_EFFECTIVE': explicit_items})
+            print(f"→ type={content_type}: playlist_items já definido ({explicit_items}) — sem nova sondagem")
+            raise SystemExit(0)
+
+          cookie_args = []
+          if os.path.exists('/tmp/cookies.txt'):
+            cookie_args = ['--cookies', '/tmp/cookies.txt']
+
+          # Sondagem — MESMO comando indicado pelo user: --print
+          # resolução/tamanho aproximado. --flat-playlist não baixa nada,
+          # só lista metadados (rápido).
+          cmd = ['yt-dlp', '--flat-playlist', '--remote-components', 'ejs:github',
+                 *cookie_args,
+                 '--print', '%(playlist_index)s\t%(id)s\t%(filesize_approx)s',
+                 '-f', f"bestvideo[height<={os.environ['MAX_H']}]",
+                 video_url]
+          r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+          if r.returncode != 0:
+            print(f"⚠ Sondagem da playlist falhou (rc={r.returncode}): {r.stderr.strip()[:400]}")
+          items = []
+          for line in r.stdout.splitlines():
+            parts = line.split('\t')
+            if len(parts) < 2 or not parts[0].strip().isdigit():
+              continue
+            size = 0
+            if len(parts) > 2:
+              try: size = int(float(parts[2]))
+              except (ValueError, TypeError): size = 0
+            items.append({'index': parts[0].strip(), 'id': parts[1].strip(), 'size': size})
+
+          if not items:
+            print("⚠ Sondagem não devolveu itens — a tratar como vídeo único (fallback, mesma URL)")
+            write_env({'IS_PLAYLIST': 'false', 'PLAYLIST_ITEMS_EFFECTIVE': ''})
+            raise SystemExit(0)
+
+          print(f"✓ Playlist sondada: {len(items)} item(ns), ordem: {[it['index'] for it in items]}")
+
+          if content_type == 'anime':
+            # Anime: sem separação — playlist inteira neste job, na ordem
+            # que o yt-dlp já devolve (playlist_index).
+            write_env({'PLAYLIST_ITEMS_EFFECTIVE': ''})
+            print("→ anime: playlist inteira processada neste job (sem Coordinator, sem split)")
+            raise SystemExit(0)
+
+          # series — mesmo cálculo/tecto do [Coordinator] do
+          # process-leve.yml: est(size) = size*0.55*1.17, BATCH_LIMIT =
+          # 1400MB. Reaproveitado tal e qual, não reinventado.
+          def est(size):
+            return int(size * 0.55 * 1.17)
+          BATCH_LIMIT = 1_400 * 1024 * 1024
+
+          batches, cur, cur_size = [], [], 0
+          for it in items:
+            e = est(it['size'])
+            if cur and cur_size + e > BATCH_LIMIT:
+              batches.append(cur)
+              cur, cur_size = [it], e
+            else:
+              cur.append(it)
+              cur_size += e
+          if cur:
+            batches.append(cur)
+
+          print(f"→ series: {len(batches)} batch(es) — batch 1 processa neste job, resto vai pra fila do lote F")
+          for i, b in enumerate(batches):
+            idxs = ','.join(v['index'] for v in b)
+            print(f"   batch {i+1}: itens {idxs} (~{sum(v['size'] for v in b)//(1024*1024)}MB raw)")
+
+          first = batches[0]
+          write_env({'PLAYLIST_ITEMS_EFFECTIVE': ','.join(v['index'] for v in first)})
+
+          worker_base = os.environ.get('LOTE_F_WORKER_BASE', '').rstrip('/')
+          worker_key  = os.environ.get('LOTE_F_WORKER_KEY', '')
+
+          if len(batches) > 1:
+            if not worker_base:
+              print("✗ LOTE_F_WORKER_BASE/LOTE_F_WORKER_KEY não configurados neste repo — "
+                    "impossível enfileirar os batches restantes. Configure os secrets com o "
+                    "MESMO valor já usado em WORKER_BASE/WORKER_KEY do ingest-novo.js. Só o "
+                    "batch 1 será processado; a série NÃO ficará completa sem isso.")
+            for i, b in enumerate(batches[1:], start=2):
+              if not worker_base:
+                break
+              idxs = ','.join(v['index'] for v in b)
+              child_job_id = f"{job_id}-b{i}"
+              body = {
+                'job_id': child_job_id,
+                'video_url': video_url,
+                'metadata': metadata,
+                'playlist_items': idxs,
+                'thumbnail_url': os.environ.get('INPUT_THUMBNAIL_URL', ''),
+                'seg_duration': os.environ.get('SEG_DURATION', '4'),
+                'max_encode_height': os.environ.get('MAX_H', '720'),
+              }
+              req = urllib.request.Request(
+                f"{worker_base}/upload-event", data=json.dumps(body).encode(),
+                headers={'Content-Type': 'application/json', 'x-api-key': worker_key},
+                method='POST')
+              try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                  print(f"   ✓ batch {i} enfileirado no lote F: {child_job_id} (HTTP {resp.status})")
+              except Exception as ex:
+                print(f"   ✗ falha ao enfileirar batch {i} ({child_job_id}): {ex} — "
+                      f"este batch NÃO entrará na fila, a série ficará incompleta pra ele")
+          else:
+            print("→ series: playlist inteira cabe num único batch — sem enfileiramento adicional")
+          PYEOF
+
+      # ═══════════════════════════════════════════════════════════════════
+      # DOWNLOAD (vídeo único) — yt-dlp, único modo suportado pra
+      # movie/documentary/dorama/rain/relaxation/ai/other. Seletor
+      # adaptativo (nunca itag fixo). INALTERADO — só ganhou o `if`.
       # ═══════════════════════════════════════════════════════════════════
 
       - name: Descarregar vídeo (yt-dlp)
+        if: env.IS_PLAYLIST != 'true'
         env:
           VIDEO_URL: ${{ inputs.video_url }}
           # Opcional: cookies de sessão em formato Netscape, se o canal
@@ -228,6 +447,7 @@ jobs:
           PYEOF
 
       - name: Probe do vídeo
+        if: env.IS_PLAYLIST != 'true'
         run: |
           ffprobe -v quiet -print_format json -show_streams -show_format "$VIDEO_PATH" > "$WORK_DIR/probe.json"
           python3 << 'PYEOF'
@@ -283,6 +503,7 @@ jobs:
           PYEOF
 
       - name: HLS encode (stream copy se h264 nativo, senão libx264 ultrafast CRF26)
+        if: env.IS_PLAYLIST != 'true'
         run: |
           HLS_DIR="$WORK_DIR/hls"
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
@@ -337,6 +558,7 @@ jobs:
           echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
 
       - name: Obter thumbnails
+        if: env.IS_PLAYLIST != 'true'
         env:
           INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
         run: |
@@ -372,7 +594,7 @@ jobs:
             tmp = f"{thumb_dir}/thumb_0.tmp"
             print(f"  Descarregando thumbnail: {thumb_url}")
             # maxresdefault.jpg nem sempre existe (vídeos antigos/verticais);
-            # se vier 404/placeholder pequeno, cai no frame extraído abaixo.
+            # se vier 404/placeholder pequeno, cai no fallback abaixo.
             subprocess.run(['curl','-sL','--retry','2','--retry-delay','2','--max-time','15',
               '-H','User-Agent: Mozilla/5.0','-o',tmp,thumb_url], capture_output=True)
             if is_valid_image(tmp):
@@ -400,6 +622,7 @@ jobs:
           PYEOF
 
       - name: Encriptar segmentos → .bin
+        if: env.IS_PLAYLIST != 'true'
         run: |
           python3 << 'PYEOF'
           import os, json, secrets, struct
@@ -446,11 +669,221 @@ jobs:
           print(f"✓ {len(seg_files)} segmentos encriptados")
           PYEOF
 
+      # ═══════════════════════════════════════════════════════════════════
+      # PLAYLIST (série/anime) — baixa+processa N episódios NESTE job,
+      # reaproveitando as MESMAS regras de probe/encode/thumbnail/
+      # encriptação já usadas acima pro vídeo único, só que em loop, uma
+      # subpasta por episódio ($WORK_DIR/items/<playlist_index>/...).
+      # Nada aqui reinventa a lógica de codec/stream-copy/HLS/ChaCha20 —
+      # é a mesma, chamada por função em vez de inline, por episódio.
+      # ═══════════════════════════════════════════════════════════════════
+      - name: 'Playlist: baixar e processar episódios'
+        if: env.IS_PLAYLIST == 'true'
+        env:
+          VIDEO_URL:      ${{ inputs.video_url }}
+          YTDLP_COOKIES:  ${{ secrets.YTDLP_COOKIES }}
+        run: |
+          COOKIE_ARGS=()
+          if [ -n "$YTDLP_COOKIES" ]; then
+            echo "$YTDLP_COOKIES" > /tmp/cookies.txt
+            COOKIE_ARGS=(--cookies /tmp/cookies.txt)
+          fi
+
+          python3 << 'PYEOF'
+          import os, json, subprocess, math, secrets as pysecrets, struct
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+
+          work_dir     = os.environ['WORK_DIR']
+          video_url    = os.environ['VIDEO_URL']
+          max_h        = int(os.environ['MAX_H'])
+          seg_duration = int(os.environ['SEG_DURATION'])
+          items_arg    = os.environ.get('PLAYLIST_ITEMS_EFFECTIVE', '').strip()
+          chacha_key   = bytes.fromhex(os.environ['CHACHA_KEY'])
+          if len(os.environ['CHACHA_KEY']) != 64:
+            raise ValueError('CHACHA_KEY inválido')
+
+          cookie_args = []
+          if os.path.exists('/tmp/cookies.txt'):
+            cookie_args = ['--cookies', '/tmp/cookies.txt']
+
+          items_dir = os.path.join(work_dir, 'items')
+          os.makedirs(items_dir, exist_ok=True)
+
+          # ── 1. Descarregar os itens (mesmo seletor/critérios do modo
+          # vídeo único, um yt-dlp só por playlist, filtrado por
+          # --playlist-items quando aplicável). ────────────────────────
+          out_tmpl = os.path.join(items_dir, '%(playlist_index)s', 'input.%(ext)s')
+          for d in ('%(playlist_index)s',):
+            pass  # yt-dlp cria as subpastas sozinho via output template
+
+          cmd = ['yt-dlp', *cookie_args, '--remote-components', 'ejs:github',
+                 '-S', f"res:{max_h},vcodec:h264,acodec:aac,ext:mp4:m4a",
+                 '-f', f"bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]",
+                 '--merge-output-format', 'mp4',
+                 '--retries', '5', '--fragment-retries', '5', '--sleep-requests', '1',
+                 '--yes-playlist', '-o', out_tmpl]
+          if items_arg:
+            cmd += ['--playlist-items', items_arg]
+          cmd.append(video_url)
+
+          print(f"→ yt-dlp playlist (items={items_arg or 'todos'})")
+          r = subprocess.run(cmd)
+          if r.returncode != 0:
+            raise SystemExit(f"ERRO: yt-dlp playlist falhou (rc={r.returncode})")
+
+          episodes = []
+          for name in sorted(os.listdir(items_dir), key=lambda x: (len(x), x)):
+            ep_dir = os.path.join(items_dir, name)
+            if not os.path.isdir(ep_dir) or not name.isdigit():
+              continue
+            files = [f for f in os.listdir(ep_dir) if f.startswith('input.')]
+            if not files:
+              print(f"  ⚠ ep{name}: nenhum ficheiro baixado — ignorado")
+              continue
+            episodes.append({'ep_num': int(name), 'video_path': os.path.join(ep_dir, files[0]), 'dir': ep_dir})
+
+          if not episodes:
+            raise SystemExit("ERRO: nenhum episódio baixado pela playlist")
+
+          episodes.sort(key=lambda e: e['ep_num'])
+          print(f"✓ {len(episodes)} episódio(s) baixado(s): {[e['ep_num'] for e in episodes]}")
+
+          # ── 2. Probe + HLS encode + thumbnail + encriptação — MESMA
+          # lógica dos steps de vídeo único, chamada por função, por
+          # episódio. ──────────────────────────────────────────────────
+          def probe_video(video_path):
+            r = subprocess.run(['ffprobe','-v','quiet','-print_format','json',
+                                 '-show_streams','-show_format', video_path],
+                                capture_output=True, text=True)
+            d = json.loads(r.stdout)
+            vs = next((s for s in d['streams'] if s['codec_type'] == 'video'), {})
+            as_ = next((s for s in d['streams'] if s['codec_type'] == 'audio'), {})
+            fmt = d['format']
+            num, den = map(int, vs.get('r_frame_rate', '24/1').split('/'))
+            fps = num / den if den else num
+            return {
+              'duration': float(fmt.get('duration', 0)),
+              'width': vs.get('width', 1920), 'height': vs.get('height', 1080),
+              'codec': vs.get('codec_name', 'unknown'),
+              'audio_codec': as_.get('codec_name', 'unknown'),
+              'fps': fps, 'bitrate': int(fmt.get('bit_rate', 0)),
+            }
+
+          def encode_hls(video_path, hls_dir, probe, seg_duration, max_h):
+            os.makedirs(hls_dir, exist_ok=True)
+            stream_copy = (probe['codec'] == 'h264')
+            if stream_copy:
+              eff_h, eff_w, will_scale = probe['height'], probe['width'], False
+            else:
+              eff_h = min(probe['height'], max_h)
+              will_scale = probe['height'] > max_h
+              eff_w = round((probe['width'] / probe['height']) * eff_h / 2) * 2 if will_scale else probe['width']
+            audio_copy = (probe['audio_codec'] == 'aac')
+            gop = int(math.ceil(probe['fps'] * seg_duration))
+
+            def build_args(force_reencode):
+              if stream_copy and not force_reencode:
+                vargs = ['-c:v', 'copy']
+              else:
+                vargs = (['-vf', f'scale=-2:{eff_h}'] if will_scale else []) + \
+                        ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26',
+                         '-tune', 'fastdecode', '-profile:v', 'high', '-level', '4.0',
+                         '-pix_fmt', 'yuv420p', '-g', str(gop), '-keyint_min', str(seg_duration)]
+              if audio_copy and not force_reencode:
+                aargs = ['-c:a', 'copy']
+              else:
+                aargs = ['-c:a', 'aac', '-b:a', '128k', '-ac', '2']
+              return vargs, aargs
+
+            def run_encode(force_reencode):
+              vargs, aargs = build_args(force_reencode)
+              cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'warning', '-stats',
+                     '-i', video_path, *vargs, *aargs,
+                     '-f', 'hls', '-hls_time', str(seg_duration),
+                     '-hls_playlist_type', 'vod', '-hls_segment_type', 'fmp4',
+                     '-hls_fmp4_init_filename', 'init.mp4', '-hls_flags', 'independent_segments',
+                     '-hls_segment_filename', os.path.join(hls_dir, 'seg%05d.m4s'),
+                     '-y', os.path.join(hls_dir, 'index.m3u8')]
+              return subprocess.run(cmd).returncode == 0
+
+            ok = run_encode(force_reencode=False)
+            if not ok and (stream_copy or audio_copy):
+              for f in os.listdir(hls_dir):
+                if f.endswith('.m4s') or f in ('init.mp4', 'index.m3u8'):
+                  os.remove(os.path.join(hls_dir, f))
+              ok = run_encode(force_reencode=True)
+            if not ok:
+              raise RuntimeError(f'Encode falhou para {video_path}')
+
+            label = ('4k' if eff_h >= 2160 else '1440p' if eff_h >= 1440 else
+                     '1080p' if eff_h >= 1080 else '720p' if eff_h >= 720 else f'{eff_h}p')
+            return {'eff_w': eff_w, 'eff_h': eff_h, 'label': label}
+
+          def extract_thumb(video_path, out_path, duration, time_pct=0.07):
+            t = max(1.0, duration * time_pct)
+            r = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-ss', f'{t:.2f}',
+                                 '-i', video_path, '-vframes', '1', '-vf', 'scale=1280:-2',
+                                 '-q:v', '2', '-y', out_path], capture_output=True)
+            return r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 5000
+
+          def encrypt_dir(hls_dir):
+            CHUNK_SIZE = 65536
+            def encrypt_segment(data):
+              chunks = [data[i:i+CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
+              out = [struct.pack('<I', len(chunks))]
+              for chunk in chunks:
+                nonce = pysecrets.token_bytes(12)
+                nonce_field = struct.pack('<I', 1) + nonce
+                ct = Cipher(algorithms.ChaCha20(chacha_key, nonce_field), None).encryptor().update(chunk)
+                out.append(nonce); out.append(struct.pack('<I', len(ct))); out.append(ct)
+              return b''.join(out)
+
+            nonce_map = {}
+            init_src = os.path.join(hls_dir, 'init.mp4')
+            if os.path.exists(init_src):
+              with open(init_src, 'rb') as f: data = f.read()
+              enc = encrypt_segment(data)
+              with open(os.path.join(hls_dir, 'init.bin'), 'wb') as f: f.write(enc)
+              os.remove(init_src)
+              nonce_map['init.bin'] = f"chunked:{struct.unpack('<I', enc[:4])[0]}"
+            for fname in sorted(f for f in os.listdir(hls_dir) if f.endswith('.m4s')):
+              with open(os.path.join(hls_dir, fname), 'rb') as f: data = f.read()
+              enc = encrypt_segment(data)
+              bin_name = fname.replace('.m4s', '.bin')
+              with open(os.path.join(hls_dir, bin_name), 'wb') as f: f.write(enc)
+              os.remove(os.path.join(hls_dir, fname))
+              nonce_map[bin_name] = f"chunked:{struct.unpack('<I', enc[:4])[0]}"
+            return nonce_map
+
+          manifest = []
+          for ep in episodes:
+            print(f"── Episódio {ep['ep_num']} ──")
+            probe = probe_video(ep['video_path'])
+            hls_dir = os.path.join(ep['dir'], 'hls')
+            quality = encode_hls(ep['video_path'], hls_dir, probe, seg_duration, max_h)
+            thumbs_dir = os.path.join(ep['dir'], 'thumbs')
+            os.makedirs(thumbs_dir, exist_ok=True)
+            thumb_path = os.path.join(thumbs_dir, 'thumb_0.jpg')
+            has_thumb = extract_thumb(ep['video_path'], thumb_path, probe['duration'])
+            nonce_map = encrypt_dir(hls_dir)
+            os.remove(ep['video_path'])  # libertar espaço já, como no modo vídeo único
+            manifest.append({
+              'ep_num': ep['ep_num'], 'dir': ep['dir'], 'hls_dir': hls_dir,
+              'thumbs_dir': thumbs_dir, 'has_thumb': has_thumb,
+              'probe': probe, 'quality': quality, 'nonce_map': nonce_map,
+            })
+            print(f"  ✓ ep{ep['ep_num']}: {quality['label']} | {len(nonce_map)-1} segmento(s)")
+
+          json.dump(manifest, open(os.path.join(work_dir, 'episodes_manifest.json'), 'w'))
+          print(f"✓ {len(manifest)} episódio(s) processado(s) e prontos pra envio")
+          PYEOF
+
       - name: Libertar espaço — remover vídeo fonte
         if: always()
         run: |
           rm -rf "$WORK_DIR/incoming"
-          echo "✓ Vídeo fonte removido"
+          rm -rf "$WORK_DIR/items"/*/input.* 2>/dev/null || true
+          echo "✓ Vídeo(s) fonte removido(s)"
 
       # ═══════════════════════════════════════════════════════════════════
       # STORAGE — idêntico ao process-leve.yml (token de instalação da
@@ -516,6 +949,7 @@ jobs:
           PYEOF
 
       - name: Escolher shard, gerar URLs e enviar (com fallback automático de shard cheio)
+        if: env.IS_PLAYLIST != 'true'
         env:
           STORAGE_TOKEN: ${{ env.STORAGE_TARGET_TOKEN }}
           STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
@@ -732,7 +1166,232 @@ jobs:
           print(f"✓ Envio concluído — shard definitivo: {final_shard}")
           PYEOF
 
+      # ═══════════════════════════════════════════════════════════════════
+      # PLAYLIST — mesma mecânica de shard/push acima, generalizada pra N
+      # episódios num único push (uma subpasta por episódio dentro do
+      # mesmo job_id/branch). Reaproveita literalmente as mesmas funções
+      # pick_shard/create_repo/push_batch — só push_all_batches passa a
+      # copiar vários episódios em vez de 1 hls/thumbs.
+      # ═══════════════════════════════════════════════════════════════════
+      - name: 'Playlist: escolher shard e enviar episódios'
+        if: env.IS_PLAYLIST == 'true'
+        env:
+          STORAGE_TOKEN: ${{ env.STORAGE_TARGET_TOKEN }}
+          STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
+          STORAGE_CREATE_PAT: ${{ secrets.STORAGE_CREATE_PAT }}
+        run: |
+          git config --global core.deltaBaseCacheLimit 2047m
+          git config --global core.looseObjects 0
+          git config --global pack.compression 0
+          git config --global pack.window 0
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+          git config --global repack.useDeltaBaseOffset true
+          git config --global advice.detachedHead false
+
+          python3 << 'PYEOF'
+          import os, subprocess, json, time, random, re, shutil
+
+          THRESHOLD_KB       = 3_500 * 1024
+          MAX_SHARDS_TO_SCAN = 20
+          MAX_SHARD_ATTEMPTS = 5
+          BATCH_SIZE         = 400
+
+          owner      = os.environ['STORAGE_OWNER']
+          token      = os.environ['STORAGE_TOKEN']
+          work_dir   = os.environ['WORK_DIR']
+          job_id     = os.environ['JOB_ID']
+          job_branch = os.environ['JOB_BRANCH']
+          seg_duration = int(os.environ['SEG_DURATION'])
+
+          manifest = json.load(open(os.path.join(work_dir, 'episodes_manifest.json')))
+
+          def api(method, path, data=None):
+            cmd = ['curl','-s','-L','-w','\n%{http_code}','-X',method,
+                   '-H',f'Authorization: Bearer {token}','-H','Accept: application/vnd.github+json',
+                   f'https://api.github.com{path}']
+            if data is not None: cmd += ['-d', json.dumps(data)]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            out = r.stdout
+            body, _, code = out.rpartition('\n') if '\n' in out else ('', '', out)
+            try: return int(code.strip()), body
+            except ValueError: return 0, body
+
+          def get_repo_size_kb(repo, max_attempts=4):
+            last_code = 0
+            for attempt in range(1, max_attempts + 1):
+              code, out = api('GET', f'/repos/{owner}/{repo}')
+              if code == 200: return True, json.loads(out).get('size', 0)
+              if code == 404: return False, 0
+              last_code = code
+              wait = [3, 8, 15, 25][min(attempt - 1, 3)]
+              print(f"  ⚠ GET {repo} → HTTP {code or 'sem resposta'} — tentativa {attempt}/{max_attempts}, aguarda {wait}s...")
+              time.sleep(wait)
+            print(f"  ✗ GET {repo} falhou após {max_attempts} tentativas (último HTTP {last_code})")
+            return None, 0
+
+          def create_repo(repo):
+            create_pat = os.environ.get('STORAGE_CREATE_PAT', '')
+            if not create_pat:
+              print(f"  ✗ STORAGE_CREATE_PAT não configurado — impossível criar {repo}"); return False
+            cmd = ['curl','-s','-w','\n%{http_code}','-X','POST',
+                   '-H',f'Authorization: Bearer {create_pat}','-H','Accept: application/vnd.github+json',
+                   'https://api.github.com/user/repos',
+                   '-d', json.dumps({'name': repo, 'private': False, 'auto_init': True})]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            out = r.stdout
+            body, _, code_str = out.rpartition('\n') if '\n' in out else ('', '', out)
+            try: cc = int(code_str.strip())
+            except ValueError: cc = 0
+            if cc == 201: return True
+            if cc == 422: print(f"  ⚠ {repo} já existe — reutilizando"); return True
+            print(f"  ✗ Falha ao criar {repo}: HTTP {cc} {body[:200]}"); return False
+
+          def pick_shard(exclude):
+            eligible = []
+            n = 1
+            while n <= MAX_SHARDS_TO_SCAN:
+              repo = f'compiled{n:02d}'
+              if repo in exclude: n += 1; continue
+              existe, size_kb = get_repo_size_kb(repo)
+              if existe is None: raise SystemExit(1)
+              if not existe:
+                print(f"  → {repo} não existe ainda, a criar...")
+                if not create_repo(repo): raise SystemExit(1)
+                return repo
+              size_mb = size_kb // 1024
+              print(f"  {repo}: {size_mb}MB")
+              if size_kb < THRESHOLD_KB: eligible.append(repo)
+              n += 1
+            if eligible:
+              chosen = random.choice(eligible)
+              print(f"  → {len(eligible)} shard(s) elegível(eis): {eligible} — escolhido: {chosen}")
+              return chosen
+            print(f"  → nenhum shard no range 1..{MAX_SHARDS_TO_SCAN} tem espaço — procurando além disso...")
+            HARD_CEILING = 200
+            while n <= HARD_CEILING:
+              repo = f'compiled{n:02d}'
+              if repo in exclude: n += 1; continue
+              existe, size_kb = get_repo_size_kb(repo)
+              if existe is None: raise SystemExit(1)
+              if not existe:
+                print(f"  → {repo} não existe — a criar...")
+                if not create_repo(repo): raise SystemExit(1)
+                return repo
+              if size_kb < THRESHOLD_KB:
+                print(f"  → {repo} já existe e tem espaço ({size_kb//1024}MB) — reutilizando")
+                return repo
+              print(f"  {repo}: {size_kb//1024}MB — cheio, avançando")
+              n += 1
+            print(f"  ✗ Nenhum slot de shard livre até compiled{HARD_CEILING:02d}"); raise SystemExit(1)
+
+          def rewrite_urls_for_episode(shard, ep):
+            raw_base = f"https://cdn.jsdelivr.net/gh/{owner}/{shard}@{job_branch}/{job_id}/ep{ep['ep_num']}"
+            hls_dir = ep['hls_dir']
+            orig_index = hls_dir + '/index.m3u8.orig'
+            shutil.copy(hls_dir + '/index.m3u8', orig_index)
+            with open(orig_index) as f: content = f.read()
+            content = re.sub(r'#EXT-X-MAP:URI="init\.mp4"', f'#EXT-X-MAP:URI="{raw_base}/hls/init.bin"', content)
+            content = re.sub(r'^(seg\d+)\.m4s$', lambda m: f"{raw_base}/hls/{m.group(1)}.bin", content, flags=re.MULTILINE)
+            with open(hls_dir + '/index.m3u8', 'w') as f: f.write(content)
+
+            bin_files = sorted(f for f in os.listdir(hls_dir) if f.endswith('.bin') and f != 'init.bin')
+            if bin_files:
+              total_bytes = sum(os.path.getsize(os.path.join(hls_dir, f)) for f in bin_files)
+              duration_s  = len(bin_files) * seg_duration
+              real_bitrate = int((total_bytes * 8) / duration_s) if duration_s > 0 else 2000000
+            else:
+              real_bitrate = int(ep['probe'].get('bitrate') or 2000000)
+            eff_w, eff_h = ep['quality']['eff_w'], ep['quality']['eff_h']
+            master = '\n'.join(['#EXTM3U', '#EXT-X-VERSION:6', '',
+              f'#EXT-X-STREAM-INF:BANDWIDTH={real_bitrate},RESOLUTION={eff_w}x{eff_h}',
+              f'{raw_base}/hls/index.m3u8'])
+            with open(os.path.join(ep['dir'], 'master.m3u8'), 'w') as f: f.write(master)
+
+            thumb_urls = [f"{raw_base}/thumbs/thumb_0.jpg"] if ep['has_thumb'] else []
+            cdn_urls = [f"{raw_base}/master.m3u8", f"{raw_base}/hls/index.m3u8", f"{raw_base}/hls/init.bin"]
+            seg_names = sorted(bn for bn in ep['nonce_map'] if bn != 'init.bin')
+            cdn_urls += [f"{raw_base}/hls/{bn}" for bn in seg_names]
+            cdn_urls += thumb_urls
+            json.dump({'cdn_urls': cdn_urls, 'thumb_urls': thumb_urls, 'master_url': f"{raw_base}/master.m3u8"},
+                      open(os.path.join(ep['dir'], 'urls.json'), 'w'))
+
+          def push_batch(batch_num, total_batches, max_attempts=8):
+            for attempt in range(1, max_attempts + 1):
+              print(f"→ Lote {batch_num}/{total_batches} — push tentativa {attempt}/{max_attempts}...")
+              r = subprocess.run(['git', 'push', '-q', '--force', 'origin', job_branch], capture_output=True, text=True)
+              out = (r.stdout + r.stderr)
+              if r.returncode == 0:
+                print(f"✓ Lote {batch_num}/{total_batches} enviado (tentativa {attempt})"); return 'ok'
+              if any(m in out.lower() for m in ('size quota', 'pre-receive hook declined', 'repository is above')):
+                print(f"✗ Shard cheio (quota): {out.strip()[:300]}"); return 'quota'
+              wait = attempt * 8 + random.randint(0, 10)
+              print(f"  ⚠ Push falhou (transitório) — retry em {wait}s... {out.strip()[:300]}")
+              time.sleep(wait)
+            print(f"✗ Lote {batch_num}/{total_batches} falhou após {max_attempts} tentativas"); return 'fail'
+
+          def push_all_episodes(shard):
+            repo_url = f"https://x-access-token:{token}@github.com/{owner}/{shard}.git"
+            shutil.rmtree('/tmp/shard', ignore_errors=True)
+            os.makedirs('/tmp/shard')
+            os.chdir('/tmp/shard')
+            subprocess.run(['git', 'init', '-q'], check=True)
+            subprocess.run(['git', 'checkout', '-q', '-b', job_branch], check=True)
+            subprocess.run(['git', 'remote', 'add', 'origin', repo_url], check=True)
+
+            files = []
+            for ep in manifest:
+              base = f'{job_id}/ep{ep["ep_num"]}'
+              os.makedirs(f'{base}/hls', exist_ok=True)
+              for f in sorted(os.listdir(ep['hls_dir'])):
+                shutil.copy(os.path.join(ep['hls_dir'], f), f'{base}/hls/{f}')
+                files.append(f'{base}/hls/{f}')
+              shutil.copy(os.path.join(ep['dir'], 'master.m3u8'), f'{base}/master.m3u8')
+              files.append(f'{base}/master.m3u8')
+              if ep['has_thumb']:
+                os.makedirs(f'{base}/thumbs', exist_ok=True)
+                shutil.copy(os.path.join(ep['thumbs_dir'], 'thumb_0.jpg'), f'{base}/thumbs/thumb_0.jpg')
+                files.append(f'{base}/thumbs/thumb_0.jpg')
+
+            total = len(files)
+            num_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+            print(f"→ {total} ficheiro(s) de {len(manifest)} episódio(s) em {num_batches} lote(s) na branch {job_branch} (shard {shard})")
+
+            for bi in range(num_batches):
+              batch = files[bi*BATCH_SIZE:(bi+1)*BATCH_SIZE]
+              for rel in batch:
+                subprocess.run(['git', 'add', rel], check=True)
+              subprocess.run(['git', '-c', 'user.name=sv-bot', '-c', 'user.email=sv-bot@pixgo.frii.site',
+                               'commit', '-m', f'job={job_id} lote={bi+1}/{num_batches}', '-q'])
+              result = push_batch(bi+1, num_batches)
+              if result != 'ok':
+                os.chdir('/'); shutil.rmtree('/tmp/shard', ignore_errors=True)
+                return result
+            os.chdir('/'); shutil.rmtree('/tmp/shard', ignore_errors=True)
+            print(f"✓ Todos os {num_batches} lote(s) enviados para {shard}@{job_branch}: {job_id}")
+            return 'ok'
+
+          exclude = set()
+          final_shard = None
+          for shard_attempt in range(1, MAX_SHARD_ATTEMPTS + 1):
+            print(f"════ Shard — tentativa {shard_attempt}/{MAX_SHARD_ATTEMPTS} (excluindo: {sorted(exclude) or '-'}) ════")
+            shard = pick_shard(exclude)
+            print(f"✓ Shard escolhido: {shard}")
+            for ep in manifest:
+              rewrite_urls_for_episode(shard, ep)
+            result = push_all_episodes(shard)
+            if result == 'ok': final_shard = shard; break
+            elif result == 'quota': exclude.add(shard)
+            else: raise SystemExit(1)
+
+          if not final_shard: raise SystemExit(1)
+          with open(os.environ['GITHUB_ENV'], 'a') as f: f.write(f"SHARD_REPO={final_shard}\n")
+          print(f"✓ Envio concluído — shard definitivo: {final_shard}")
+          PYEOF
+
       - name: Registar no EdgeOne (Turso + KV)
+        if: env.IS_PLAYLIST != 'true'
         continue-on-error: true
         env:
           METADATA:      ${{ inputs.metadata }}
@@ -794,6 +1453,83 @@ jobs:
             except Exception as e: print(f"⚠ Tentativa {attempt} — {e}")
             if attempt < 5: time.sleep([5,10,20,40][attempt-1])
           print("✓ Registo concluído")
+          PYEOF
+
+      # ═══════════════════════════════════════════════════════════════════
+      # PLAYLIST — 1 registo POR EPISÓDIO, reaproveitando exactamente os
+      # MESMOS campos seasonNumber/episodeNumber/episodeTitle já usados
+      # pelo process-leve.yml (nenhum campo novo). ep_num vem do
+      # playlist_index real do yt-dlp — nunca precisou de offset.
+      # ═══════════════════════════════════════════════════════════════════
+      - name: 'Playlist: registar episódios no EdgeOne (Turso + KV)'
+        if: env.IS_PLAYLIST == 'true'
+        continue-on-error: true
+        env:
+          METADATA:      ${{ inputs.metadata }}
+          STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request, urllib.error, datetime, time
+
+          pipeline_api = os.environ.get('PIPELINE_API','').rstrip('/')
+          if not pipeline_api: print('⚠ PIPELINE_API não configurado'); raise SystemExit(0)
+
+          work_dir      = os.environ['WORK_DIR']
+          job_id        = os.environ['JOB_ID']
+          seg_dur       = int(os.environ.get('SEG_DURATION', '4') or '4')
+          storage_owner = os.environ['STORAGE_OWNER']
+          shard_repo    = os.environ['SHARD_REPO']
+          job_branch    = os.environ['JOB_BRANCH']
+
+          try: metadata = json.loads(os.environ.get('METADATA','{}'))
+          except: metadata = {}
+          content_type = (metadata.get('type') or 'video').strip().lower()
+          content_id   = metadata.get('contentId', job_id)
+
+          manifest = json.load(open(os.path.join(work_dir, 'episodes_manifest.json')))
+
+          for ep in manifest:
+            raw_base = f"https://cdn.jsdelivr.net/gh/{storage_owner}/{shard_repo}@{job_branch}/{job_id}/ep{ep['ep_num']}"
+            urls = json.load(open(os.path.join(ep['dir'], 'urls.json')))
+            probe = ep['probe']
+            eff_w, eff_h = ep['quality']['eff_w'], ep['quality']['eff_h']
+            seg_count = len([k for k in ep['nonce_map'] if k != 'init.bin'])
+
+            body = {
+              'contentId': content_id, 'title': metadata.get('title', 'Untitled'),
+              'description': metadata.get('description', ''), 'type': content_type,
+              'year': int(metadata.get('year') or datetime.datetime.now().year),
+              'lang': metadata.get('lang', 'pt'), 'duration': round(probe.get('duration', 0)),
+              'thumbnail': urls['thumb_urls'][0] if urls['thumb_urls'] else '',
+              'thumbnails': urls['thumb_urls'], 'qualities': [ep['quality']['label']],
+              'width': eff_w, 'height': eff_h, 'codec': 'h264', 'fps': probe.get('fps', 24),
+              'bitrate': probe.get('bitrate', 0), 'segmentCount': seg_count, 'segDuration': seg_dur,
+              'videoID': f"{job_id}-ep{ep['ep_num']}", 'cdnUrls': urls['cdn_urls'],
+              'encrypted': True, 'encryption': 'chacha20-chunk-v2', 'container': 'fmp4', 'segExt': 'bin',
+              'masterUrl': urls['master_url'], 'noncesUrl': '',
+              'storageRepo': shard_repo, 'storageOwner': storage_owner, 'storageBranch': job_branch,
+              # MESMOS 3 campos já usados pelo process-leve.yml pra
+              # episódios — nenhum campo novo inventado.
+              'seasonNumber': '1', 'episodeNumber': str(ep['ep_num']), 'episodeTitle': '',
+            }
+            payload = json.dumps(body).encode()
+            ok = False
+            for attempt in range(1, 6):
+              req = urllib.request.Request(f"{pipeline_api}/api/pipeline/register", data=payload,
+                headers={'Content-Type': 'application/json', 'X-API-Key': os.environ.get('ADMIN_API_KEY', '')}, method='POST')
+              try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                  print(f"✓ ep{ep['ep_num']} registado ({r.status})"); ok = True; break
+              except urllib.error.HTTPError as e:
+                if e.code < 500 and e.code != 429:
+                  print(f"  ep{ep['ep_num']} — erro cliente ({e.code})"); break
+                print(f"⚠ ep{ep['ep_num']} tentativa {attempt} — HTTP {e.code}")
+              except Exception as e:
+                print(f"⚠ ep{ep['ep_num']} tentativa {attempt} — {e}")
+              if attempt < 5: time.sleep([5,10,20,40][attempt-1])
+            if not ok:
+              print(f"✗ ep{ep['ep_num']} NÃO foi registado após 5 tentativas")
+          print(f"✓ Registo de {len(manifest)} episódio(s) concluído")
           PYEOF
 
       - name: Notificar dispatcher (webhook FIFO)
