@@ -749,6 +749,14 @@ jobs:
                  '-f', f"bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]",
                  '--merge-output-format', 'mp4',
                  '--retries', '5', '--fragment-retries', '5', '--sleep-requests', '1',
+                 # --ignore-errors: um item indisponível/privado/idade-
+                 # restrita não pode derrubar a playlist inteira — sem
+                 # isto o yt-dlp já baixava o resto (visto em log real:
+                 # "Finished downloading playlist" aparece mesmo assim),
+                 # mas ainda saía com rc=1 no fim, e o código abaixo
+                 # tratava QUALQUER rc!=0 como fatal e descartava
+                 # episódios que já tinham baixado com sucesso.
+                 '--ignore-errors',
                  '--yes-playlist', '-o', out_tmpl]
           if items_arg:
             cmd += ['--playlist-items', items_arg]
@@ -757,7 +765,14 @@ jobs:
           print(f"→ yt-dlp playlist (items={items_arg or 'todos'})")
           r = subprocess.run(cmd)
           if r.returncode != 0:
-            raise SystemExit(f"ERRO: yt-dlp playlist falhou (rc={r.returncode})")
+            # Não fatal aqui de propósito: com --ignore-errors, rc!=0
+            # normalmente significa "pelo menos 1 item da playlist
+            # falhou", não "nada baixou". O gate real de falha fatal é
+            # "nenhum episódio baixado", logo abaixo, depois de
+            # verificar o disco de facto.
+            print(f"⚠ yt-dlp terminou com rc={r.returncode} — pelo menos um item da playlist "
+                  f"provavelmente falhou (indisponível/privado/idade-restrita); a continuar só "
+                  f"com os episódios que baixaram de facto")
 
           episodes = []
           for name in sorted(os.listdir(items_dir), key=lambda x: (len(x), x)):
@@ -771,7 +786,7 @@ jobs:
             episodes.append({'ep_num': int(name), 'video_path': os.path.join(ep_dir, files[0]), 'dir': ep_dir})
 
           if not episodes:
-            raise SystemExit("ERRO: nenhum episódio baixado pela playlist")
+            raise SystemExit("ERRO: nenhum episódio baixado pela playlist (falha real, não só item isolado indisponível)")
 
           episodes.sort(key=lambda e: e['ep_num'])
           print(f"✓ {len(episodes)} episódio(s) baixado(s): {[e['ep_num'] for e in episodes]}")
