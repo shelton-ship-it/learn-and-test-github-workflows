@@ -62,7 +62,12 @@ name: StreamVault Process (Super Leve DLP)
 # Novo input do workflow_dispatch: `playlist_items` (yt-dlp
 # --playlist-items) — vazio = decidir agora (série) ou playlist inteira
 # (anime); preenchido = job já sabe o range dele (veio de um batch
-# enfileirado). 8 inputs no total — dentro do limite rígido de 10 do
+# enfileirado). Mais `skip_first_item` ("true"/"false", default
+# "false") — quando activo, o 1º vídeo sondado na playlist é removido da
+# lista ANTES de decidir anime/série, nunca é baixado/processado; o
+# resto (numeração, batches) sai já sem ele. Só é aplicado na sondagem
+# inicial — batches já enfileirados herdam a lista já filtrada, nunca
+# reaplicam o skip. 9 inputs no total — dentro do limite rígido de 10 do
 # GitHub (confirmado por pesquisa, ver histórico do process-leve.yml).
 #
 # Numeração de episódio: usa o `playlist_index` real do próprio yt-dlp
@@ -112,6 +117,10 @@ on:
         description: 'yt-dlp --playlist-items (uso interno série/anime). Vazio = decidir agora (série) ou playlist inteira (anime); preenchido = job já é um batch com range definido.'
         required: false
         default: ''
+      skip_first_item:
+        description: '"true" para ignorar sempre o 1º vídeo da playlist (série/anime) — nunca é baixado/processado, numeração/batches do resto saem sem ele.'
+        required: false
+        default: 'false'
 
 jobs:
   process:
@@ -186,6 +195,7 @@ jobs:
           VIDEO_URL:            ${{ inputs.video_url }}
           INPUT_METADATA:       ${{ inputs.metadata }}
           INPUT_PLAYLIST_ITEMS: ${{ inputs.playlist_items }}
+          INPUT_SKIP_FIRST:     ${{ inputs.skip_first_item }}
           INPUT_THUMBNAIL_URL:  ${{ inputs.thumbnail_url }}
           YTDLP_COOKIES:        ${{ secrets.YTDLP_COOKIES }}
           # MESMA credencial que o ingest-novo.js já usa (hardcoded lá
@@ -258,6 +268,8 @@ jobs:
               except (ValueError, TypeError): size = 0
             items.append({'index': parts[0].strip(), 'id': parts[1].strip(), 'size': size})
 
+          items.sort(key=lambda it: int(it['index']))
+
           if not items:
             print("⚠ Sondagem não devolveu itens — a tratar como vídeo único (fallback, mesma URL)")
             write_env({'IS_PLAYLIST': 'false', 'PLAYLIST_ITEMS_EFFECTIVE': ''})
@@ -265,11 +277,27 @@ jobs:
 
           print(f"✓ Playlist sondada: {len(items)} item(ns), ordem: {[it['index'] for it in items]}")
 
+          # skip_first_item: ignora sempre o 1º vídeo da playlist — nunca
+          # é baixado/processado. Aplica-se só na sondagem inicial (uma
+          # vez), porque os batches de série já enfileirados (branch
+          # `explicit_items` acima) herdam a lista já sem ele.
+          skip_first = os.environ.get('INPUT_SKIP_FIRST', 'false').strip().lower() == 'true'
+          if skip_first and items:
+            removed = items.pop(0)
+            print(f"→ skip_first_item ativo: ignorando item {removed['index']} (id={removed['id']}) — nunca será baixado/processado")
+
+          if not items:
+            print("⚠ Nada sobrou da playlist depois do skip_first_item — nenhum vídeo a processar")
+            write_env({'IS_PLAYLIST': 'false', 'PLAYLIST_ITEMS_EFFECTIVE': ''})
+            raise SystemExit(0)
+
           if content_type == 'anime':
-            # Anime: sem separação — playlist inteira neste job, na ordem
-            # que o yt-dlp já devolve (playlist_index).
-            write_env({'PLAYLIST_ITEMS_EFFECTIVE': ''})
-            print("→ anime: playlist inteira processada neste job (sem Coordinator, sem split)")
+            # Anime: sem separação por tamanho — playlist inteira (menos
+            # o 1º item, se skip_first_item) neste job. Índices explícitos
+            # em vez de "" porque, com skip activo, precisamos excluir o
+            # 1º item mesmo — "" baixaria a playlist inteira sem exclusão.
+            write_env({'PLAYLIST_ITEMS_EFFECTIVE': ','.join(it['index'] for it in items)})
+            print(f"→ anime: {len(items)} item(ns) processado(s) neste job, na ordem da playlist (sem Coordinator, sem split)")
             raise SystemExit(0)
 
           # series — mesmo cálculo/tecto do [Coordinator] do
