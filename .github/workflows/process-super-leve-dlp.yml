@@ -46,18 +46,18 @@ name: StreamVault Process (Super Leve DLP)
 #     LITERALMENTE INALTERADO (todos os steps antigos só ganharam
 #     `if: env.IS_PLAYLIST != 'true'`, que resolve pra 'true' == false
 #     pra estes tipos, ou seja, corre exactamente como antes).
-#   - anime → link lógico = URL de PLAYLIST do YouTube. 1 job baixa e
-#     processa a playlist INTEIRA, na ordem que o próprio yt-dlp já
-#     lista (playlist_index), sem Coordinator, sem separar em vários
-#     jobs.
-#   - series → mesma URL de playlist, mas sonda antes (--flat-playlist
-#     --print, mesmo comando indicado) e decide quantos vídeos cabem
-#     NESTE job (mesmo cálculo/tecto do Coordinator do process-leve.yml:
-#     filesize*0.55*1.17, tecto de 1400MB) — o resto fica em fila no
+#   - anime / series → mesma URL de playlist, tratados de forma
+#     IDÊNTICA quanto a batching (ver ronda "batch unificado" mais
+#     abaixo): sonda antes (--flat-playlist --print) e decide quantos
+#     vídeos cabem NESTE job (cálculo/tecto do Coordinator do
+#     process-leve.yml: filesize*0.55*1.17) — o resto fica em fila no
 #     PRÓPRIO mecanismo do lote F (POST /upload-event no worker do lote,
-#     já existente), respeitando as janelas normais de disparo. A
-#     playlist só é dada por concluída quando o último batch enfileirado
-#     tiver corrido.
+#     já existente — entra na FILA pendente, nunca abre uma janela por
+#     si só), respeitando as janelas normais de disparo (cron 08h ou
+#     botão manual). A playlist só é dada por concluída quando o último
+#     batch enfileirado tiver corrido. A única diferença remanescente
+#     entre os dois tipos é cosmética (rótulo/numeração), não o
+#     mecanismo de split.
 #
 # Novo input do workflow_dispatch: `playlist_items` (yt-dlp
 # --playlist-items) — vazio = decidir agora (série) ou playlist inteira
@@ -374,22 +374,37 @@ jobs:
             write_env({'IS_PLAYLIST': 'false', 'PLAYLIST_ITEMS_EFFECTIVE': ''})
             raise SystemExit(0)
 
-          if content_type == 'anime':
-            # Anime: sem separação por tamanho — playlist inteira (menos
-            # o 1º item, se skip_first_item) neste job. Índices explícitos
-            # em vez de "" porque, com skip activo, precisamos excluir o
-            # 1º item mesmo — "" baixaria a playlist inteira sem exclusão.
-            write_env({'PLAYLIST_ITEMS_EFFECTIVE': ','.join(it['index'] for it in items)})
-            write_id_map({it['index']: it['id'] for it in items})
-            print(f"→ anime: {len(items)} item(ns) processado(s) neste job, na ordem da playlist (sem Coordinator, sem split)")
-            raise SystemExit(0)
-
-          # series — mesmo cálculo/tecto do [Coordinator] do
-          # process-leve.yml: est(size) = size*0.55*1.17, BATCH_LIMIT =
-          # 1400MB. Reaproveitado tal e qual, não reinventado.
+          # anime/series — RONDA "BATCH UNIFICADO + LIMITE REALISTA":
+          # antes, anime baixava a playlist inteira num job só, sem
+          # checagem de tamanho nenhuma — risco real de estourar o disco
+          # do runner numa playlist grande (o download de TODOS os itens
+          # acontece de uma vez, antes de qualquer processamento/limpeza).
+          # Agora os dois tipos passam pelo MESMO cálculo/split — a única
+          # diferença remanescente é cosmética (rótulo/numeração).
+          #
+          # est(size) = size*0.55*1.17 — mesma fórmula herdada do
+          # [Coordinator] do process-leve.yml, mantida tal e qual.
+          #
+          # BATCH_LIMIT — recalibrado. O valor antigo (1400MB estimado,
+          # ~2.1GB de download bruto) presumia um disco bem menor do que
+          # o real. O runner ubuntu-latest documenta 14GB só pra um disco
+          # temporário separado (/mnt) — o filesystem onde $WORK_DIR
+          # (/tmp/...) realmente vive é a partição raiz, que na prática
+          # tem ~25-29GB livres antes do job começar (confirmado por
+          # múltiplas fontes independentes sobre a infra real do runner,
+          # não pela doc oficial de specs). Descontando o que os steps de
+          # setup instalam (ffmpeg via apt, yt-dlp/deps via pip, Deno —
+          # ordem de poucas centenas de MB) e uma margem de segurança
+          # generosa pra cobrir: (a) o pico durante o push, quando o
+          # conteúdo já codificado/encriptado em $WORK_DIR é COPIADO de
+          # novo pra /tmp/shard antes do git add/commit (praticamente
+          # dobra o footprint do que sobrou depois do raw ser apagado),
+          # e (b) variação entre instâncias de runner — 6000MB estimado
+          # (~9.1GB de download bruto por batch) fica com folga
+          # confortável sob esse teto real, mesmo somando os dois picos.
           def est(size):
             return int(size * 0.55 * 1.17)
-          BATCH_LIMIT = 1_400 * 1024 * 1024
+          BATCH_LIMIT = 6_000 * 1024 * 1024
 
           batches, cur, cur_size = [], [], 0
           for it in items:
@@ -403,7 +418,7 @@ jobs:
           if cur:
             batches.append(cur)
 
-          print(f"→ series: {len(batches)} batch(es) — batch 1 processa neste job, resto vai pra fila do lote F")
+          print(f"→ {content_type}: {len(batches)} batch(es) — batch 1 processa neste job, resto vai pra fila do lote F")
           for i, b in enumerate(batches):
             idxs = ','.join(v['index'] for v in b)
             print(f"   batch {i+1}: itens {idxs} (~{sum(v['size'] for v in b)//(1024*1024)}MB raw)")
@@ -420,12 +435,18 @@ jobs:
               print("✗ LOTE_F_WORKER_BASE/LOTE_F_WORKER_KEY não configurados neste repo — "
                     "impossível enfileirar os batches restantes. Configure os secrets com o "
                     "MESMO valor já usado em WORKER_BASE/WORKER_KEY do ingest-novo.js. Só o "
-                    "batch 1 será processado; a série NÃO ficará completa sem isso.")
+                    f"batch 1 será processado; o(a) {content_type} NÃO ficará completo(a) sem isso.")
             for i, b in enumerate(batches[1:], start=2):
               if not worker_base:
                 break
               idxs = ','.join(v['index'] for v in b)
               child_job_id = f"{job_id}-b{i}"
+              # POST /upload-event só ADICIONA à fila pendente do lote F
+              # (array `pending` no KV do worker) — nunca abre uma leva/
+              # janela por si só. Quem decide disparar é o cron das 08h
+              # ou o botão manual /admin/open-now (ver lote-f-worker.js).
+              # Fila (pendente) e janela (disparo) são coisas diferentes
+              # de propósito — este POST nunca confunde as duas.
               body = {
                 'job_id': child_job_id,
                 'video_url': video_url,
@@ -441,12 +462,12 @@ jobs:
                 method='POST')
               try:
                 with urllib.request.urlopen(req, timeout=15) as resp:
-                  print(f"   ✓ batch {i} enfileirado no lote F: {child_job_id} (HTTP {resp.status})")
+                  print(f"   ✓ batch {i} enfileirado (fila pendente) no lote F: {child_job_id} (HTTP {resp.status})")
               except Exception as ex:
                 print(f"   ✗ falha ao enfileirar batch {i} ({child_job_id}): {ex} — "
-                      f"este batch NÃO entrará na fila, a série ficará incompleta pra ele")
+                      f"este batch NÃO entrará na fila, o(a) {content_type} ficará incompleto(a) pra ele")
           else:
-            print("→ series: playlist inteira cabe num único batch — sem enfileiramento adicional")
+            print(f"→ {content_type}: playlist inteira cabe num único batch — sem enfileiramento adicional")
           PYEOF
 
       # ═══════════════════════════════════════════════════════════════════
@@ -713,7 +734,14 @@ jobs:
             if h[:6] in (b'GIF87a', b'GIF89a'): return 'gif'
             return 'jpg'
 
-          def is_valid_image(path, min_bytes=1000):
+          # min_bytes baixo de propósito: thumbnails legítimas podem vir
+          # bem pequenas — ex. URLs do tipo
+          # https://encrypted-tbn0.gstatic.com/images?q=tbn:...&s=10 (cache
+          # de thumbnail do Google Images) frequentemente devolvem imagens
+          # de poucas centenas de bytes. O sinal real de validade é a
+          # assinatura binária (magic bytes) abaixo, não o tamanho — o
+          # min_bytes serve só pra descartar downloads vazios/truncados.
+          def is_valid_image(path, min_bytes=100):
             if not os.path.exists(path) or os.path.getsize(path) < min_bytes: return False
             with open(path, 'rb') as f: h = f.read(12)
             return (h[:3] == b'\xff\xd8\xff' or h[:4] == b'\x89PNG' or h[:4] == b'RIFF' or
@@ -1002,7 +1030,14 @@ jobs:
             if h[:6] in (b'GIF87a', b'GIF89a'): return 'gif'
             return 'jpg'
 
-          def is_valid_image(path, min_bytes=1000):
+          # min_bytes baixo de propósito: thumbnails legítimas podem vir
+          # bem pequenas — ex. URLs do tipo
+          # https://encrypted-tbn0.gstatic.com/images?q=tbn:...&s=10 (cache
+          # de thumbnail do Google Images) frequentemente devolvem imagens
+          # de poucas centenas de bytes. O sinal real de validade é a
+          # assinatura binária (magic bytes) abaixo, não o tamanho — o
+          # min_bytes serve só pra descartar downloads vazios/truncados.
+          def is_valid_image(path, min_bytes=100):
             if not os.path.exists(path) or os.path.getsize(path) < min_bytes: return False
             with open(path, 'rb') as f: h = f.read(12)
             return (h[:3] == b'\xff\xd8\xff' or h[:4] == b'\x89PNG' or h[:4] == b'RIFF' or
