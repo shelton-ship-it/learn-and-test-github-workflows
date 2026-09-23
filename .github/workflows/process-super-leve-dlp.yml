@@ -29,7 +29,7 @@ name: StreamVault Process (Super Leve DLP)
 # decide isso, igual já decidia pra fontes h264 de torrent.
 #
 # ═══════════════════════════════════════════════════════════════════════
-# RONDA "TIPOS + PLAYLIST" (esta edição) — MISSÃO 1 E 2, resumo:
+# RONDA "TIPOS + PLAYLIST" — MISSÃO 1 E 2, resumo:
 #
 # MISSÃO 1 — tipos do process-leve passam a ser aceites aqui também
 # (metadata.type): 'movie', 'documentary', 'dorama' (rótulo "Animações"),
@@ -83,6 +83,58 @@ name: StreamVault Process (Super Leve DLP)
 # aqui como secret do repo (LOTE_F_WORKER_BASE / LOTE_F_WORKER_KEY).
 # Sinalizado explicitamente ao user — não inventado, só replicado.
 # ═══════════════════════════════════════════════════════════════════════
+#
+# ═══════════════════════════════════════════════════════════════════════
+# RONDA "THUMBNAILS SEM FRAME" (esta edição) — resumo:
+#
+# Extração de frame via ffmpeg (fallback antigo, tanto no modo vídeo
+# único quanto no modo playlist) foi REMOVIDA por completo — não existe
+# mais em lado nenhum deste ficheiro, nem como último recurso.
+#
+# Nova cadeia de fallback pra thumbnail (vale pra TODOS os tipos —
+# movie/documentary/dorama/rain/relaxation/ai/other/anime/series):
+#   1. `thumbnail_url` (input do workflow, vindo do ingest) — se vier
+#      preenchido, tenta baixar essa imagem, de QUALQUER plataforma
+#      (curl genérico, sem restrição de domínio — nunca foi restrito a
+#      YT, isso já era assim antes desta ronda).
+#   2. Se vazio, OU se o download da URL fornecida falhar/vier
+#      inválido: fallback pra thumbnail nativa do YouTube, em cascata
+#      de qualidade decrescente — maxresdefault → sddefault →
+#      hqdefault → mqdefault → default. As 3 últimas praticamente
+#      sempre existem (ao contrário de maxresdefault, que falha pra
+#      vídeos antigos/verticais) — isso garante cobertura quase total
+#      sem precisar de frame extraído do vídeo.
+#   3. Se nem isso funcionar (sem videoId resolvido, ou as 5
+#      qualidades falharem): sem thumbnail pra esse item — não há mais
+#      fallback de frame pra cobrir esse caso.
+#
+# Pra caso 2 funcionar precisa do videoId real de cada vídeo:
+#   - Modo vídeo único: capturado logo após o download, via uma chamada
+#     leve extra de yt-dlp (--skip-download --print id), sem custo de
+#     rede adicional relevante.
+#   - Modo playlist (anime/série): o videoId de cada episódio já vem da
+#     sondagem (--flat-playlist --print) que decide batch/playlist — só
+#     precisou persistir esse mapeamento índice→id num ficheiro
+#     ($WORK_DIR/playlist_ids.json) pra sobreviver até o step de
+#     processamento dos episódios. Batches enfileirados (que pulavam a
+#     sondagem, branch `explicit_items`) agora fazem uma sondagem leve
+#     adicional (só pra mapear id, reaproveitando o mesmo
+#     --playlist-items já recebido) — sem isso, os episódios de batches
+#     2+ de uma série nunca teriam fallback de thumbnail.
+#
+# `thumbnail_url`, em modo playlist, é uma ÚNICA imagem pro job inteiro
+# (o formulário do ingest só tem um campo, não um por episódio) — se
+# fornecida, é baixada UMA vez e reutilizada em todos os episódios desse
+# job; se não fornecida, cada episódio cai no fallback individual do YT
+# usando o seu próprio videoId.
+#
+# Nenhum input novo de workflow_dispatch foi necessário (continuam 9,
+# dentro do limite de 10) — tudo isto é resolvido internamente com o que
+# já existia. dispatcher-novo.js e lote-f-worker.js não precisaram de
+# nenhuma alteração: ambos já eram pass-through puro do campo
+# thumbnail_url (confirmado por leitura de código), sem qualquer
+# validação/restrição de plataforma.
+# ═══════════════════════════════════════════════════════════════════════
 
 on:
   workflow_dispatch:
@@ -106,7 +158,7 @@ on:
         required: false
         default: '{}'
       thumbnail_url:
-        description: 'URL da thumbnail (JPG/PNG) — normalmente i.ytimg.com/vi/<id>/maxresdefault.jpg'
+        description: 'URL da thumbnail (qualquer plataforma). Se vazio, cai no fallback nativo do YouTube (maxresdefault→...→default). Sem fallback de frame extraído.'
         required: false
         default: ''
       timeout_minutes:
@@ -188,7 +240,8 @@ jobs:
       # se for série, decide também QUANTOS itens cabem neste job e
       # enfileira o resto no lote F. Roda ANTES do download — tudo que
       # vem depois só lê IS_PLAYLIST/PLAYLIST_ITEMS_EFFECTIVE, escritos
-      # aqui.
+      # aqui. Também persiste $WORK_DIR/playlist_ids.json (índice→videoId)
+      # pra alimentar o fallback de thumbnail por episódio mais adiante.
       # ═══════════════════════════════════════════════════════════════════
       - name: Detectar playlist e decidir batch (série/anime)
         env:
@@ -216,6 +269,7 @@ jobs:
           except: metadata = {}
           content_type   = (metadata.get('type') or 'video').strip().lower()
           job_id         = os.environ['JOB_ID']
+          work_dir       = os.environ['WORK_DIR']
           video_url      = os.environ['VIDEO_URL']
           explicit_items = os.environ.get('INPUT_PLAYLIST_ITEMS', '').strip()
 
@@ -223,6 +277,20 @@ jobs:
             with open(os.environ['GITHUB_ENV'], 'a') as f:
               for k, v in d.items():
                 f.write(f"{k}={v}\n")
+
+          def write_id_map(mapping):
+            # índice_playlist(str) -> videoId — consumido pelo fallback de
+            # thumbnail por episódio no step de processamento da playlist.
+            with open(os.path.join(work_dir, 'playlist_ids.json'), 'w') as f:
+              json.dump(mapping, f)
+
+          # cookie_args precisa estar disponível tanto no caminho de
+          # "batch já definido" (early return abaixo) quanto no caminho
+          # de sondagem completa — por isso definido aqui em cima, antes
+          # de qualquer branch.
+          cookie_args = []
+          if os.path.exists('/tmp/cookies.txt'):
+            cookie_args = ['--cookies', '/tmp/cookies.txt']
 
           # Qualquer tipo que não seja anime/series segue a regra "video":
           # 1 link = 1 vídeo = 1 job — pipeline de sempre, sem tocar em
@@ -236,15 +304,30 @@ jobs:
           write_env({'IS_PLAYLIST': 'true'})
 
           # Job já chegou com o range dele definido — é um batch de série
-          # já enfileirado (ou uma continuação); não sonda de novo.
+          # já enfileirado (ou uma continuação); não sonda de novo pra
+          # decidir o batch. Mesmo assim faz uma sondagem LEVE (mesmo
+          # range, --flat-playlist, sem custo de download) só pra montar
+          # o mapa índice→videoId — sem isso, os episódios de batches 2+
+          # nunca teriam fallback de thumbnail do YouTube.
           if explicit_items:
             write_env({'PLAYLIST_ITEMS_EFFECTIVE': explicit_items})
-            print(f"→ type={content_type}: playlist_items já definido ({explicit_items}) — sem nova sondagem")
+            print(f"→ type={content_type}: playlist_items já definido ({explicit_items}) — sem nova sondagem de batch")
+            id_cmd = ['yt-dlp', '--flat-playlist', '--remote-components', 'ejs:github',
+                       *cookie_args, '--playlist-items', explicit_items,
+                       '--print', '%(playlist_index)s\t%(id)s', video_url]
+            try:
+              r_id = subprocess.run(id_cmd, capture_output=True, text=True, timeout=120)
+              id_map = {}
+              for line in r_id.stdout.splitlines():
+                parts = line.split('\t')
+                if len(parts) == 2 and parts[0].strip().isdigit():
+                  id_map[parts[0].strip()] = parts[1].strip()
+              write_id_map(id_map)
+              print(f"✓ {len(id_map)} videoId(s) mapeado(s) pra fallback de thumbnail deste batch")
+            except Exception as ex:
+              print(f"⚠ Sondagem leve de videoIds falhou ({ex}) — episódios deste batch ficarão sem fallback de thumbnail do YouTube")
+              write_id_map({})
             raise SystemExit(0)
-
-          cookie_args = []
-          if os.path.exists('/tmp/cookies.txt'):
-            cookie_args = ['--cookies', '/tmp/cookies.txt']
 
           # Sondagem — MESMO comando indicado pelo user: --print
           # resolução/tamanho aproximado. --flat-playlist não baixa nada,
@@ -297,6 +380,7 @@ jobs:
             # em vez de "" porque, com skip activo, precisamos excluir o
             # 1º item mesmo — "" baixaria a playlist inteira sem exclusão.
             write_env({'PLAYLIST_ITEMS_EFFECTIVE': ','.join(it['index'] for it in items)})
+            write_id_map({it['index']: it['id'] for it in items})
             print(f"→ anime: {len(items)} item(ns) processado(s) neste job, na ordem da playlist (sem Coordinator, sem split)")
             raise SystemExit(0)
 
@@ -326,6 +410,7 @@ jobs:
 
           first = batches[0]
           write_env({'PLAYLIST_ITEMS_EFFECTIVE': ','.join(v['index'] for v in first)})
+          write_id_map({it['index']: it['id'] for it in first})
 
           worker_base = os.environ.get('LOTE_F_WORKER_BASE', '').rstrip('/')
           worker_key  = os.environ.get('LOTE_F_WORKER_KEY', '')
@@ -416,6 +501,21 @@ jobs:
           if [ "$SIZE" -lt 10000 ]; then
             echo "⚠ Ficheiro demasiado pequeno — download provavelmente falhou"
             exit 1
+          fi
+
+          # videoId real resolvido pelo yt-dlp — necessário pro fallback
+          # de thumbnail nativa do YouTube (i.ytimg.com/vi/<id>/...) mais
+          # adiante, já que a URL de entrada pode ser youtu.be/embed/
+          # shorts e não necessariamente ?v=<id>. Chamada leve, sem
+          # download (--skip-download), reaproveita as mesmas cookies.
+          VIDEO_ID=$(yt-dlp "${COOKIE_ARGS[@]}" --remote-components ejs:github \
+            --skip-download --no-warnings -q --playlist-items 1 \
+            --print id "$VIDEO_URL" 2>/dev/null | head -1)
+          echo "VIDEO_ID=$VIDEO_ID" >> $GITHUB_ENV
+          if [ -n "$VIDEO_ID" ]; then
+            echo "✓ videoId resolvido: $VIDEO_ID"
+          else
+            echo "⚠ Não foi possível resolver videoId — fallback de thumbnail do YouTube ficará indisponível pra este vídeo (só a thumbnail_url fornecida, se houver, poderá funcionar)"
           fi
 
       - name: Renovar cookie do yt-dlp (self-refresh)
@@ -585,16 +685,23 @@ jobs:
           echo "✓ $(ls $HLS_DIR/*.m4s | wc -l) segmentos .m4s gerados"
           echo "✓ init.mp4: $(du -sh $HLS_DIR/init.mp4 | cut -f1)"
 
-      - name: Obter thumbnails
+      # ═══════════════════════════════════════════════════════════════════
+      # THUMBNAIL (vídeo único) — RONDA "THUMBNAILS SEM FRAME": sem
+      # extração de frame em lado nenhum. Cadeia: thumbnail_url fornecida
+      # (qualquer plataforma) → fallback nativo do YouTube em cascata de
+      # qualidade (maxresdefault→sddefault→hqdefault→mqdefault→default).
+      # Se nada disso resolver, o item fica sem thumbnail.
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Obter thumbnail
         if: env.IS_PLAYLIST != 'true'
         env:
           INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
         run: |
           python3 << 'PYEOF'
           import subprocess, os, json
+
           thumb_dir = os.environ['WORK_DIR'] + '/thumbs'
-          duration  = float(os.environ['PROBE_DURATION'])
-          video     = os.environ['VIDEO_PATH']
+          video_id  = os.environ.get('VIDEO_ID', '').strip()
           thumb_url = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
           thumbs    = []
 
@@ -606,44 +713,55 @@ jobs:
             if h[:6] in (b'GIF87a', b'GIF89a'): return 'gif'
             return 'jpg'
 
-          def is_valid_image(path, min_bytes=5000):
+          def is_valid_image(path, min_bytes=1000):
             if not os.path.exists(path) or os.path.getsize(path) < min_bytes: return False
             with open(path, 'rb') as f: h = f.read(12)
             return (h[:3] == b'\xff\xd8\xff' or h[:4] == b'\x89PNG' or h[:4] == b'RIFF' or
                     h[:6] in (b'GIF87a', b'GIF89a'))
 
-          def extract_frame(video, out_path, time_pct=0.07):
-            t = max(1.0, duration * time_pct)
-            r = subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-ss',f'{t:.2f}',
-              '-i',video,'-vframes','1','-vf','scale=1280:-2','-q:v','2','-y',out_path], capture_output=True)
-            return r.returncode == 0 and is_valid_image(out_path)
-
-          if thumb_url:
-            tmp = f"{thumb_dir}/thumb_0.tmp"
-            print(f"  Descarregando thumbnail: {thumb_url}")
-            # maxresdefault.jpg nem sempre existe (vídeos antigos/verticais);
-            # se vier 404/placeholder pequeno, cai no fallback abaixo.
+          def try_download(url, out_base):
+            tmp = out_base + '.tmp'
             subprocess.run(['curl','-sL','--retry','2','--retry-delay','2','--max-time','15',
-              '-H','User-Agent: Mozilla/5.0','-o',tmp,thumb_url], capture_output=True)
+              '-H','User-Agent: Mozilla/5.0','-o',tmp,url], capture_output=True)
             if is_valid_image(tmp):
               ext = detect_image_ext(tmp)
-              final_path = f"{thumb_dir}/thumb_0.{ext}"
+              final_path = f"{out_base}.{ext}"
               os.replace(tmp, final_path)
-              thumbs.append({'path':final_path,'ext':ext,'time':0,'index':0})
-              print(f"✓ Thumbnail válida ({os.path.getsize(final_path)//1024} KB, .{ext})")
+              return final_path
+            if os.path.exists(tmp): os.remove(tmp)
+            return None
+
+          result = None
+
+          # Tier 1 — URL explícita fornecida no ingest. Qualquer
+          # plataforma — curl genérico, nunca restrito a domínio do YT.
+          if thumb_url:
+            print(f"  Tentando thumbnail fornecida: {thumb_url}")
+            result = try_download(thumb_url, f"{thumb_dir}/thumb_0")
+            if result:
+              print(f"✓ Thumbnail fornecida válida ({os.path.getsize(result)//1024} KB)")
             else:
-              if os.path.exists(tmp): os.remove(tmp)
-              out = f"{thumb_dir}/thumb_0.jpg"
-              if extract_frame(video, out):
-                thumbs.append({'path':out,'ext':'jpg','time':0,'index':0})
-                print(f"✓ Frame extraído como fallback (thumbnail do YouTube indisponível)")
-              else: print('✗ Falha ao extrair frame')
-          else:
-            out = f"{thumb_dir}/thumb_0.jpg"
-            if extract_frame(video, out, time_pct=0.07):
-              thumbs.append({'path':out,'ext':'jpg','time':duration*0.07,'index':0})
-              print(f"✓ Frame extraído: {os.path.getsize(out)//1024} KB")
-            else: print('✗ Não foi possível extrair frame')
+              print("⚠ Thumbnail fornecida falhou/indisponível — caindo pro fallback do YouTube")
+
+          # Tier 2 — fallback nativo do YouTube, em cascata de qualidade
+          # decrescente. maxresdefault nem sempre existe (vídeos antigos/
+          # verticais); as demais praticamente sempre existem. Sem
+          # extração de frame como último recurso (removida de propósito).
+          if not result and video_id:
+            for quality in ('maxresdefault', 'sddefault', 'hqdefault', 'mqdefault', 'default'):
+              url = f"https://i.ytimg.com/vi/{video_id}/{quality}.jpg"
+              result = try_download(url, f"{thumb_dir}/thumb_0")
+              if result:
+                print(f"✓ Fallback YouTube ({quality}) válido ({os.path.getsize(result)//1024} KB)")
+                break
+            if not result:
+              print(f"✗ Nenhuma qualidade de thumbnail do YouTube disponível pra videoId={video_id}")
+          elif not result:
+            print("✗ Sem videoId resolvido — impossível tentar fallback do YouTube")
+
+          if result:
+            ext = result.rsplit('.', 1)[-1]
+            thumbs.append({'path': result, 'ext': ext, 'time': 0, 'index': 0})
 
           json.dump(thumbs, open(os.environ['WORK_DIR'] + '/thumbs_manifest.json', 'w'))
           print(f"✓ {len(thumbs)} thumbnail(s)")
@@ -699,17 +817,22 @@ jobs:
 
       # ═══════════════════════════════════════════════════════════════════
       # PLAYLIST (série/anime) — baixa+processa N episódios NESTE job,
-      # reaproveitando as MESMAS regras de probe/encode/thumbnail/
-      # encriptação já usadas acima pro vídeo único, só que em loop, uma
-      # subpasta por episódio ($WORK_DIR/items/<playlist_index>/...).
-      # Nada aqui reinventa a lógica de codec/stream-copy/HLS/ChaCha20 —
-      # é a mesma, chamada por função em vez de inline, por episódio.
+      # reaproveitando as MESMAS regras de probe/encode/encriptação já
+      # usadas acima pro vídeo único, só que em loop, uma subpasta por
+      # episódio ($WORK_DIR/items/<playlist_index>/...). Thumbnail segue
+      # a mesma cadeia (URL fornecida → fallback YT em cascata) — RONDA
+      # "THUMBNAILS SEM FRAME": sem extração de frame, thumbnail_url é
+      # ÚNICA pro job inteiro (baixada 1 vez, reutilizada em todos os
+      # episódios) quando fornecida; senão, cada episódio usa o seu
+      # próprio videoId (vindo de $WORK_DIR/playlist_ids.json) pro
+      # fallback individual do YouTube.
       # ═══════════════════════════════════════════════════════════════════
       - name: 'Playlist: baixar e processar episódios'
         if: env.IS_PLAYLIST == 'true'
         env:
-          VIDEO_URL:      ${{ inputs.video_url }}
-          YTDLP_COOKIES:  ${{ secrets.YTDLP_COOKIES }}
+          VIDEO_URL:           ${{ inputs.video_url }}
+          INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
+          YTDLP_COOKIES:       ${{ secrets.YTDLP_COOKIES }}
         run: |
           COOKIE_ARGS=()
           if [ -n "$YTDLP_COOKIES" ]; then
@@ -726,6 +849,7 @@ jobs:
           max_h        = int(os.environ['MAX_H'])
           seg_duration = int(os.environ['SEG_DURATION'])
           items_arg    = os.environ.get('PLAYLIST_ITEMS_EFFECTIVE', '').strip()
+          thumb_url    = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
           chacha_key   = bytes.fromhex(os.environ['CHACHA_KEY'])
           if len(os.environ['CHACHA_KEY']) != 64:
             raise ValueError('CHACHA_KEY inválido')
@@ -741,8 +865,6 @@ jobs:
           # vídeo único, um yt-dlp só por playlist, filtrado por
           # --playlist-items quando aplicável). ────────────────────────
           out_tmpl = os.path.join(items_dir, '%(playlist_index)s', 'input.%(ext)s')
-          for d in ('%(playlist_index)s',):
-            pass  # yt-dlp cria as subpastas sozinho via output template
 
           cmd = ['yt-dlp', *cookie_args, '--remote-components', 'ejs:github',
                  '-S', f"res:{max_h},vcodec:h264,acodec:aac,ext:mp4:m4a",
@@ -791,9 +913,17 @@ jobs:
           episodes.sort(key=lambda e: e['ep_num'])
           print(f"✓ {len(episodes)} episódio(s) baixado(s): {[e['ep_num'] for e in episodes]}")
 
-          # ── 2. Probe + HLS encode + thumbnail + encriptação — MESMA
-          # lógica dos steps de vídeo único, chamada por função, por
-          # episódio. ──────────────────────────────────────────────────
+          # ── 1b. Carregar mapa índice→videoId (persistido no step de
+          # sondagem/decisão de batch) — usado pelo fallback individual
+          # de thumbnail de cada episódio quando não há thumbnail_url
+          # fornecida. ─────────────────────────────────────────────────
+          id_map_path = os.path.join(work_dir, 'playlist_ids.json')
+          id_map = json.load(open(id_map_path)) if os.path.exists(id_map_path) else {}
+          if not id_map:
+            print("⚠ playlist_ids.json vazio/ausente — fallback de thumbnail do YouTube por episódio ficará indisponível (só thumbnail_url fornecida, se houver, funcionará)")
+
+          # ── 2. Probe + HLS encode — MESMA lógica dos steps de vídeo
+          # único, chamada por função, por episódio. ─────────────────────
           def probe_video(video_path):
             r = subprocess.run(['ffprobe','-v','quiet','-print_format','json',
                                  '-show_streams','-show_format', video_path],
@@ -862,12 +992,64 @@ jobs:
                      '1080p' if eff_h >= 1080 else '720p' if eff_h >= 720 else f'{eff_h}p')
             return {'eff_w': eff_w, 'eff_h': eff_h, 'label': label}
 
-          def extract_thumb(video_path, out_path, duration, time_pct=0.07):
-            t = max(1.0, duration * time_pct)
-            r = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-ss', f'{t:.2f}',
-                                 '-i', video_path, '-vframes', '1', '-vf', 'scale=1280:-2',
-                                 '-q:v', '2', '-y', out_path], capture_output=True)
-            return r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 5000
+          # ── Thumbnail helpers — mesma lógica do modo vídeo único, sem
+          # extração de frame. ─────────────────────────────────────────
+          def detect_image_ext(path):
+            with open(path, 'rb') as f: h = f.read(16)
+            if h[:3] == b'\xff\xd8\xff': return 'jpg'
+            if h[:4] == b'\x89PNG':       return 'png'
+            if h[:4] == b'RIFF':          return 'webp'
+            if h[:6] in (b'GIF87a', b'GIF89a'): return 'gif'
+            return 'jpg'
+
+          def is_valid_image(path, min_bytes=1000):
+            if not os.path.exists(path) or os.path.getsize(path) < min_bytes: return False
+            with open(path, 'rb') as f: h = f.read(12)
+            return (h[:3] == b'\xff\xd8\xff' or h[:4] == b'\x89PNG' or h[:4] == b'RIFF' or
+                    h[:6] in (b'GIF87a', b'GIF89a'))
+
+          def try_download(url, out_base):
+            tmp = out_base + '.tmp'
+            subprocess.run(['curl','-sL','--retry','2','--retry-delay','2','--max-time','15',
+              '-H','User-Agent: Mozilla/5.0','-o',tmp,url], capture_output=True)
+            if is_valid_image(tmp):
+              ext = detect_image_ext(tmp)
+              final_path = f"{out_base}.{ext}"
+              os.replace(tmp, final_path)
+              return final_path
+            if os.path.exists(tmp): os.remove(tmp)
+            return None
+
+          # Tier 1 — thumbnail_url fornecida é ÚNICA pro job inteiro
+          # (formulário do ingest não tem um campo por episódio) —
+          # baixada 1 vez só, reutilizada em todos os episódios.
+          shared_thumb = None
+          if thumb_url:
+            print(f"→ thumbnail fornecida pra toda a leva de episódios: {thumb_url}")
+            shared_thumb = try_download(thumb_url, os.path.join(work_dir, 'shared_thumb'))
+            if shared_thumb:
+              print(f"✓ Thumbnail compartilhada válida ({os.path.getsize(shared_thumb)//1024} KB) — usada em todos os episódios")
+            else:
+              print("⚠ Thumbnail fornecida falhou — cada episódio cai pro fallback individual do YouTube")
+
+          def resolve_episode_thumb(ep_num, thumbs_dir):
+            # Tier 1 — reusa a thumbnail compartilhada, se existir.
+            if shared_thumb:
+              ext = shared_thumb.rsplit('.', 1)[-1]
+              dest = os.path.join(thumbs_dir, f'thumb_0.{ext}')
+              import shutil as _sh
+              _sh.copy(shared_thumb, dest)
+              return True, ext
+            # Tier 2 — fallback nativo do YouTube, cascata de qualidade,
+            # usando o videoId individual deste episódio.
+            ep_video_id = id_map.get(str(ep_num))
+            if ep_video_id:
+              for quality in ('maxresdefault', 'sddefault', 'hqdefault', 'mqdefault', 'default'):
+                url = f"https://i.ytimg.com/vi/{ep_video_id}/{quality}.jpg"
+                result = try_download(url, os.path.join(thumbs_dir, 'thumb_0'))
+                if result:
+                  return True, result.rsplit('.', 1)[-1]
+            return False, None
 
           def encrypt_dir(hls_dir):
             CHUNK_SIZE = 65536
@@ -906,16 +1088,18 @@ jobs:
             quality = encode_hls(ep['video_path'], hls_dir, probe, seg_duration, max_h)
             thumbs_dir = os.path.join(ep['dir'], 'thumbs')
             os.makedirs(thumbs_dir, exist_ok=True)
-            thumb_path = os.path.join(thumbs_dir, 'thumb_0.jpg')
-            has_thumb = extract_thumb(ep['video_path'], thumb_path, probe['duration'])
+            has_thumb, thumb_ext = resolve_episode_thumb(ep['ep_num'], thumbs_dir)
+            if not has_thumb:
+              print(f"  ⚠ ep{ep['ep_num']}: sem thumbnail (nem compartilhada, nem fallback do YouTube)")
             nonce_map = encrypt_dir(hls_dir)
             os.remove(ep['video_path'])  # libertar espaço já, como no modo vídeo único
             manifest.append({
               'ep_num': ep['ep_num'], 'dir': ep['dir'], 'hls_dir': hls_dir,
-              'thumbs_dir': thumbs_dir, 'has_thumb': has_thumb,
+              'thumbs_dir': thumbs_dir, 'has_thumb': has_thumb, 'thumb_ext': thumb_ext,
               'probe': probe, 'quality': quality, 'nonce_map': nonce_map,
             })
-            print(f"  ✓ ep{ep['ep_num']}: {quality['label']} | {len(nonce_map)-1} segmento(s)")
+            thumb_note = f"thumb .{thumb_ext}" if has_thumb else "sem thumb"
+            print(f"  ✓ ep{ep['ep_num']}: {quality['label']} | {len(nonce_map)-1} segmento(s) | {thumb_note}")
 
           json.dump(manifest, open(os.path.join(work_dir, 'episodes_manifest.json'), 'w'))
           print(f"✓ {len(manifest)} episódio(s) processado(s) e prontos pra envio")
@@ -1214,7 +1398,10 @@ jobs:
       # episódios num único push (uma subpasta por episódio dentro do
       # mesmo job_id/branch). Reaproveita literalmente as mesmas funções
       # pick_shard/create_repo/push_batch — só push_all_batches passa a
-      # copiar vários episódios em vez de 1 hls/thumbs.
+      # copiar vários episódios em vez de 1 hls/thumbs. Nome/extensão da
+      # thumbnail de cada episódio agora é dinâmico (ep['thumb_ext']) —
+      # RONDA "THUMBNAILS SEM FRAME": a imagem pode vir de qualquer
+      # plataforma (jpg/png/webp/gif), não só do YouTube.
       # ═══════════════════════════════════════════════════════════════════
       - name: 'Playlist: escolher shard e enviar episódios'
         if: env.IS_PLAYLIST == 'true'
@@ -1352,7 +1539,13 @@ jobs:
               f'{raw_base}/hls/index.m3u8'])
             with open(os.path.join(ep['dir'], 'master.m3u8'), 'w') as f: f.write(master)
 
-            thumb_urls = [f"{raw_base}/thumbs/thumb_0.jpg"] if ep['has_thumb'] else []
+            # RONDA "THUMBNAILS SEM FRAME": extensão dinâmica (thumb_ext
+            # persistido no manifest) em vez de ".jpg" fixo — a imagem
+            # pode ter vindo de qualquer plataforma ou do fallback YT.
+            if ep['has_thumb']:
+              thumb_urls = [f"{raw_base}/thumbs/thumb_0.{ep['thumb_ext']}"]
+            else:
+              thumb_urls = []
             cdn_urls = [f"{raw_base}/master.m3u8", f"{raw_base}/hls/index.m3u8", f"{raw_base}/hls/init.bin"]
             seg_names = sorted(bn for bn in ep['nonce_map'] if bn != 'init.bin')
             cdn_urls += [f"{raw_base}/hls/{bn}" for bn in seg_names]
@@ -1394,8 +1587,9 @@ jobs:
               files.append(f'{base}/master.m3u8')
               if ep['has_thumb']:
                 os.makedirs(f'{base}/thumbs', exist_ok=True)
-                shutil.copy(os.path.join(ep['thumbs_dir'], 'thumb_0.jpg'), f'{base}/thumbs/thumb_0.jpg')
-                files.append(f'{base}/thumbs/thumb_0.jpg')
+                thumb_name = f"thumb_0.{ep['thumb_ext']}"
+                shutil.copy(os.path.join(ep['thumbs_dir'], thumb_name), f'{base}/thumbs/{thumb_name}')
+                files.append(f'{base}/thumbs/{thumb_name}')
 
             total = len(files)
             num_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
