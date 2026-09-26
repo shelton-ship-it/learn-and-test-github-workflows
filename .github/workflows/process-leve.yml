@@ -152,7 +152,7 @@ name: StreamVault Process (Leve)
 #      uma vez. 'series' e 'anime' não têm essa limitação — continuam
 #      processando batches normalmente pelo Coordinator.
 #
-#   9. FIX CIRÚRGICO (este patch — versão final, substitui 2 tentativas
+#   9. FIX CIRÚRGICO (patch anterior — versão final, substitui 2 tentativas
 #      anteriores descartadas, ver histórico completo abaixo):
 #
 #      9a. episode_count — pro caso "1 link cobre N episódios" (torrent
@@ -259,6 +259,44 @@ name: StreamVault Process (Leve)
 #          fecho final (done/failed) do chain_root_id usa o /webhook já
 #          existente, exactamente como qualquer job sempre reportou o
 #          seu próprio fim.
+#
+#      9e. FIX CIRÚRGICO — BUG REAL ENCONTRADO (este patch): a cadeia
+#          9d parava sempre depois do 1º episódio, para sempre — sem
+#          erro visível nos logs do episódio 1 (a run simplesmente era
+#          cancelada pelo GitHub por atingir o timeout-minutes: 45 do
+#          job `process`, e o step "Continuar cadeia sequencial" nunca
+#          chegava a completar).
+#          CAUSA: o step "Continuar cadeia sequencial" fazia
+#          `time.sleep(gap)` com gap = 10-30min ANTES de disparar o
+#          próximo episódio — DENTRO do mesmo job/timeout-minutes: 45
+#          do episódio ATUAL. Esse job já gasta a maior parte dos 45min
+#          em download+probe+encode+encriptação+push+registo (o próprio
+#          comentário do timeout-minutes já documentava um caso real de
+#          22min só no download) — sobrando pouca ou nenhuma folga pro
+#          gap adicional de 10-30min. Resultado: o GitHub cancela o job
+#          a meio do time.sleep(), o dispatch do próximo episódio NUNCA
+#          é executado, e o chain_root_id (rastreado pelo lote C/D/E via
+#          /parent-status) fica 'dispatched' pra sempre — exatamente o
+#          sintoma relatado ("dispara o 1º job e trava pra sempre").
+#          Isto também explica por que os webhooks de série/anime
+#          pareciam não chegar ao dispatcher: o fecho do chain_root_id
+#          (done/failed) só acontece no ÚLTIMO elo da cadeia (ver 9d),
+#          que nunca era alcançado.
+#          FIX: o gap deixa de ser um `time.sleep()` dentro do job
+#          ATUAL (que tem pouquíssima folga de timeout sobrando) e
+#          passa a ser consumido no INÍCIO do PRÓXIMO job, que arranca
+#          com um timeout-minutes: 45 totalmente fresco. O campo
+#          `chain` ganha `start_gap_seconds` (calculado pelo elo
+#          anterior, 0 para o 1º episódio disparado pelo Coordinator);
+#          o novo step "Aguardar gap da cadeia sequencial", logo a
+#          seguir a "Preparar ambiente", consome esse valor com
+#          time.sleep() ANTES de qualquer trabalho pesado começar. O
+#          disparo do próximo episódio em "Continuar cadeia sequencial"
+#          passa a ser IMEDIATO (sem sleep) — o job atual só calcula o
+#          gap e o embute no payload do próximo, nunca espera por ele.
+#          Preserva o espaçamento entre episódios (o motivo original do
+#          gap) sem nunca mais arriscar estourar o timeout do job que
+#          precisa de disparar o próximo elo.
 # ═══════════════════════════════════════════════════════════════════════
 
 on:
@@ -287,9 +325,9 @@ on:
         required: false
         default: '{"seg_duration":"4","max_encode_height":"720","thumbnail_url":""}'
       chain:
-        description: 'JSON: { remaining_children, chain_root_id } — uso interno da cadeia sequencial de episódios (ver fix 9d)'
+        description: 'JSON: { remaining_children, chain_root_id, start_gap_seconds } — uso interno da cadeia sequencial de episódios (ver fix 9d/9e)'
         required: false
-        default: '{"remaining_children":[],"chain_root_id":""}'
+        default: '{"remaining_children":[],"chain_root_id":"","start_gap_seconds":0}'
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════
@@ -398,8 +436,28 @@ jobs:
 
           print(f"Coordinator: {metadata.get('title','?')} S{season_num:02d} | {url[:70]}...")
 
+          # FIX CIRÚRGICO — listen_interfaces: '0.0.0.0:68xx' faz o libtorrent
+          # tentar anunciar em TODAS as interfaces, incluindo loopback (127.0.0.1),
+          # que nunca alcança trackers UDP externos — confirmado em log real:
+          # mesma sessão, mesmo tracker, duas linhas: uma com [127.0.0.1:6882]
+          # "skipping tracker announce (unreachable)" e outra com [10.x.x.x:6882]
+          # "received peers: 13". O qBittorrent ignora loopback automaticamente;
+          # o libtorrent Python não. Fix: detectar o IP de saída real com um
+          # socket UDP "dry-run" (não faz ligação real, só consulta a tabela de
+          # routing do SO) e usar só esse no listen_interfaces.
+          import socket as _socket
+          _s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+          try:
+            _s.connect(('8.8.8.8', 80))
+            _local_ip = _s.getsockname()[0]
+          except Exception:
+            _local_ip = '0.0.0.0'
+          finally:
+            _s.close()
+          print(f"  Interface de rede detectada: {_local_ip}")
+
           ses = lt.session({
-            'listen_interfaces':       '0.0.0.0:6882',
+            'listen_interfaces':       f'{_local_ip}:6882',
             'enable_dht':              True,
             'enable_lsd':              True,
             'use_dht_as_fallback':     True,
@@ -681,6 +739,10 @@ jobs:
             'chain': json.dumps({
               'remaining_children': rest,
               'chain_root_id': parent_job_id,
+              # FIX 9e: 1º episódio dispara imediatamente, sem gap —
+              # ver cabeçalho do ficheiro (a espera passou a acontecer
+              # no INÍCIO do job seguinte, nunca no fim do actual).
+              'start_gap_seconds': 0,
             }),
           }
 
@@ -744,6 +806,10 @@ jobs:
     # tempo, independente de qual step está rodando. Última linha de
     # defesa. INALTERADO pelo fix 9b — só o Coordinator ganhou teto
     # próprio, este job de encode continua exactamente como sempre foi.
+    # IMPORTANTE (fix 9e): é exactamente por causa deste teto apertado
+    # que o gap entre episódios da cadeia sequencial NUNCA pode ser um
+    # time.sleep() no FIM deste job — ver step "Aguardar gap da cadeia
+    # sequencial" logo abaixo e "Continuar cadeia sequencial" no fim.
     timeout-minutes: 45
     # actions:write — necessário pro novo step "Continuar cadeia
     # sequencial" (fix 9d), que precisa de disparar o próximo episódio
@@ -798,6 +864,39 @@ jobs:
                    "/tmp/sv_work/${{ inputs.job_id }}/hls" \
                    "/tmp/sv_work/${{ inputs.job_id }}/thumbs"
 
+      # FIX 9e — NOVO STEP: consome, logo no início do job (timeout-
+      # minutes: 45 totalmente fresco), o gap que o elo ANTERIOR da
+      # cadeia calculou e embutiu em `chain.start_gap_seconds`. Isto
+      # substitui o time.sleep() que antes acontecia no FIM do job
+      # anterior (onde já não havia folga de timeout sobrando — ver
+      # cabeçalho do ficheiro). Para submissões que não fazem parte de
+      # uma cadeia (chain_root_id vazio) ou para o 1º episódio
+      # (start_gap_seconds=0), este step não espera nada.
+      - name: Aguardar gap da cadeia sequencial (se aplicável)
+        env:
+          INPUT_CHAIN: ${{ inputs.chain }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, time
+
+          try:    chain = json.loads(os.environ.get('INPUT_CHAIN', '') or '{}')
+          except: chain = {}
+
+          gap = chain.get('start_gap_seconds', 0) or 0
+          try:    gap = int(gap)
+          except (TypeError, ValueError): gap = 0
+
+          if gap > 0:
+            print(f"→ Este episódio faz parte de uma cadeia sequencial — aguardando "
+                  f"{gap // 60}min{gap % 60:02d}s de folga antes de começar (calculado "
+                  f"pelo elo anterior, consumido aqui no início do timeout-minutes: 45 "
+                  f"fresco deste job — ver fix 9e no cabeçalho do process-leve.yml)")
+            time.sleep(gap)
+            print("✓ Gap concluído — a começar o trabalho deste episódio")
+          else:
+            print("→ Sem gap a aguardar (submissão normal, ou 1º episódio da cadeia)")
+          PYEOF
+
       # Cache de pacotes .deb via ação da comunidade — evita baixar
       # ffmpeg + python3-libtorrent (e suas dependências apt) do zero em
       # todo run. Cache por branch, até 5GB no repo; invalida sozinho se
@@ -850,8 +949,21 @@ jobs:
           # então esse ramo só age se esse teto for aumentado no futuro.
           MAX_WAIT = 3600
 
+          # FIX CIRÚRGICO — mesmo problema do Coordinator: 0.0.0.0 inclui loopback.
+          # Ver comentário na sessão do Coordinator acima para a explicação completa.
+          import socket as _socket
+          _s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+          try:
+            _s.connect(('8.8.8.8', 80))
+            _local_ip = _s.getsockname()[0]
+          except Exception:
+            _local_ip = '0.0.0.0'
+          finally:
+            _s.close()
+          print(f"  Interface de rede detectada: {_local_ip}")
+
           ses = lt.session({
-            'listen_interfaces':       '0.0.0.0:6881',
+            'listen_interfaces':       f'{_local_ip}:6881',
             'enable_dht':              True,
             'enable_lsd':              True,
             'use_dht_as_fallback':     True,
@@ -1940,6 +2052,14 @@ jobs:
       # tentativa de disparar o seguinte (conteúdo diferente, falha não
       # correlacionada); só uma falha de DISPARO (retries esgotados)
       # interrompe a cadeia de facto.
+      #
+      # FIX 9e (este patch): deixou de fazer `time.sleep(gap)` aqui — o
+      # gap agora é calculado, embutido em `chain.start_gap_seconds` do
+      # PRÓXIMO episódio, e o disparo acontece IMEDIATAMENTE a seguir.
+      # Quem consome o gap é o novo step "Aguardar gap da cadeia
+      # sequencial" do PRÓXIMO job, com timeout-minutes: 45 fresco — ver
+      # cabeçalho do ficheiro pro porquê (era isto que travava a cadeia
+      # pra sempre depois do 1º episódio).
       - name: Continuar cadeia sequencial (disparar próximo episódio, se houver)
         if: always()
         continue-on-error: true
@@ -1966,24 +2086,58 @@ jobs:
           dispatcher_url = os.environ.get('DISPATCHER_URL', '').rstrip('/')
           admin_key      = os.environ.get('ADMIN_API_KEY', '')
 
-          def notify_chain_root(status):
-            """Fecha (ou reporta falha d)o job_id que o lote C/D está a
+          def notify_chain_root(status, max_attempts=4):
+            """Fecha (ou reporta falha d)o job_id que o lote C/D/E está a
             rastrear — mesmo /webhook que qualquer job já usa pra
             reportar o seu próprio fim, só que aqui reporta em nome do
             chain_root_id, não do job_id deste próprio episódio (que já
-            se reportou a si mesmo no step anterior)."""
+            se reportou a si mesmo no step anterior).
+            FIX CIRÚRGICO (evidência de log real, não suposição): a
+            versão anterior descartava o resultado do curl (-o /dev/null)
+            e imprimia sempre "reportado como '<status>'", mesmo quando o
+            POST falhava de facto. Num run real, o webhook IRMÃO deste
+            mesmo job (a poucos segundos daqui, "Notificar dispatcher
+            webhook FIFO") devolveu HTTP 000 — dispatcher inalcançável,
+            provável cold-start do Render (já documentado nesta mesma
+            missão como falha real vista em produção). Como este é o
+            ÚNICO ponto que fecha o chain_root_id, uma falha silenciosa
+            aqui deixa o lote C/D/E preso pra sempre sem NADA no log a
+            apontar a causa — a mensagem de sucesso mentia. Fix: captura
+            o HTTP code de facto (nunca -o /dev/null), faz retry com
+            backoff em Python (mesmo espírito do dispatch_next() logo
+            abaixo — o --retry interno do curl sozinho não bastou nesse
+            run real) e só imprime sucesso depois de confirmar 2xx; em
+            falha total, imprime um ERRO inequívoco em vez de fingir que
+            funcionou."""
             if not dispatcher_url:
               print(f"  ⚠ DISPATCHER_URL não configurado — não foi possível reportar chain_root_id={chain_root_id}")
-              return
-            subprocess.run([
-              'curl', '-s', '-o', '/dev/null', '-X', 'POST',
-              '-H', 'Content-Type: application/json',
-              '-H', f'x-api-key: {admin_key}',
-              '--max-time', '20', '--retry', '2', '--retry-delay', '3',
-              f'{dispatcher_url}/webhook',
-              '-d', json.dumps({'job_id': chain_root_id, 'status': status}),
-            ], capture_output=True)
-            print(f"  → chain_root_id={chain_root_id} reportado como '{status}'")
+              return False
+            for attempt in range(1, max_attempts + 1):
+              r = subprocess.run([
+                'curl', '-s', '-o', '/tmp/chain_root_notify.txt', '-w', '%{http_code}', '-X', 'POST',
+                '-H', 'Content-Type: application/json',
+                '-H', f'x-api-key: {admin_key}',
+                '--max-time', '20',
+                f'{dispatcher_url}/webhook',
+                '-d', json.dumps({'job_id': chain_root_id, 'status': status}),
+              ], capture_output=True, text=True)
+              code = r.stdout.strip()
+              if code.startswith('2'):
+                print(f"  ✓ chain_root_id={chain_root_id} reportado como '{status}' (HTTP {code}, tentativa {attempt}/{max_attempts})")
+                return True
+              wait = [5, 15, 30][min(attempt - 1, 2)]
+              if attempt < max_attempts:
+                print(f"  ⚠ tentativa {attempt}/{max_attempts} — HTTP {code or 'sem resposta (000)'} ao reportar "
+                      f"chain_root_id={chain_root_id} — aguarda {wait}s...")
+                time.sleep(wait)
+              else:
+                print(f"  ⚠ tentativa {attempt}/{max_attempts} — HTTP {code or 'sem resposta (000)'} ao reportar "
+                      f"chain_root_id={chain_root_id} — sem mais tentativas")
+            print(f"  ✗✗ FALHA DEFINITIVA ao reportar chain_root_id={chain_root_id} como '{status}' após "
+                  f"{max_attempts} tentativas — o lote C/D/E vai ficar preso à espera deste job_id (dispatcher "
+                  f"inalcançável, provável cold-start do Render). Só sai disto com intervenção manual "
+                  f"(POST /admin/release no worker) ou o teto de segurança de 9h em lotes-worker.js.")
+            return False
 
           if not remaining:
             # Último elo da cadeia — fecha o job pai que o lote está a
@@ -2003,9 +2157,18 @@ jobs:
           next_child = remaining[0]
           rest_after = remaining[1:]
 
+          # FIX 9e: gap CALCULADO aqui, mas NÃO esperado aqui — vai
+          # embutido no payload do próximo episódio (start_gap_seconds)
+          # e é o PRÓXIMO job que o consome, logo no início, com
+          # timeout-minutes: 45 fresco. Ver "Aguardar gap da cadeia
+          # sequencial" e o cabeçalho do ficheiro (fix 9e) para o porquê:
+          # um time.sleep() aqui, no FIM deste job, é o que fazia a
+          # cadeia travar pra sempre depois do 1º episódio (o job já
+          # tinha gasto a maior parte dos 45min em download/encode/push,
+          # sem folga pros 10-30min extra de gap).
           gap = random.randint(10 * 60, 30 * 60)
-          print(f"  … aguardando {gap // 60}min de folga antes do próximo episódio da cadeia")
-          time.sleep(gap)
+          print(f"  → próximo episódio da cadeia vai aguardar {gap // 60}min de folga "
+                f"NO PRÓPRIO INÍCIO dele (não aqui) antes de começar a trabalhar")
 
           dispatch_inputs = {
             'job_id':    next_child['job_id'],
@@ -2026,6 +2189,7 @@ jobs:
             'chain': json.dumps({
               'remaining_children': rest_after,
               'chain_root_id': chain_root_id,
+              'start_gap_seconds': gap,
             }),
           }
 
@@ -2041,7 +2205,8 @@ jobs:
               ], capture_output=True, text=True)
               code = r.stdout.strip()
               if code == '204':
-                print(f"  ✓ Próximo episódio da cadeia disparado: {next_child['job_id']} ({len(rest_after)} restante(s) depois dele)")
+                print(f"  ✓ Próximo episódio da cadeia disparado (imediatamente): {next_child['job_id']} "
+                      f"({len(rest_after)} restante(s) depois dele, gap de {gap // 60}min por conta dele mesmo)")
                 return True
               elif code.startswith('5') or code == '':
                 wait = [10, 25][attempt-1] if attempt <= 2 else 25
@@ -2058,7 +2223,7 @@ jobs:
             # FIX trade-off 2 (fragilidade da cadeia): sem isto, a falha
             # ficava invisível até um teto de segurança de horas no
             # lote. Reporta já como 'failed' e loga com precisão quantos
-            # episódios NUNCA chegarão a ser disparados.
+            # episódios NUNCA serão disparados.
             skipped = [next_child['job_id']] + [c['job_id'] for c in rest_after]
             print(f"  ✗ Falha ao disparar o próximo episódio da cadeia — {len(skipped)} episódio(s) NUNCA "
                   f"serão disparados: {', '.join(skipped)}")
