@@ -320,13 +320,31 @@ jobs:
           fi
 
           python3 << 'PYEOF'
-          import os, json, re, time, datetime, subprocess, urllib.request
+          import os, json, re, time, datetime, subprocess, urllib.request, urllib.error
           from urllib.parse import urlparse, parse_qs
 
           # Marcador de "mini série" (vídeo de canal, type=series sem
           # temporada/episódio) — TEM de ser igual a CHANNEL_SERIES_GENRE em
           # frontend_web/src/lib/channelSeries.ts.
           CHANNEL_SERIES_GENRE = 'miniserie'
+
+          # Vídeos de canal viram "mini série" no catálogo — por isso "filme"/
+          # "filmes" no título ou na descrição (em qualquer combinação de
+          # maiúsculas/minúsculas: filme, Filme, FILME…) são substituídos por
+          # "mini série"/"mini séries", respeitando singular/plural e o estilo
+          # de maiúsculas. Só palavra inteira (\b): "filmagem", "filmar",
+          # "cinefilme" etc. ficam intactas. Só se aplica ao coordinator de
+          # canal (é onde título/descrição vêm do YouTube); o que o operador
+          # escreve à mão no ingest nunca é mexido.
+          FILME_RE = re.compile(r'\bfilmes?\b', re.IGNORECASE)
+          def swap_filme(text):
+            def repl(m):
+              w = m.group(0)
+              base = 'mini séries' if w.lower().endswith('s') else 'mini série'
+              if w.isupper():  return base.upper()
+              if w[0].isupper(): return base.capitalize()
+              return base
+            return FILME_RE.sub(repl, text)
 
           try:    metadata = json.loads(os.environ.get('INPUT_METADATA', '') or '{}')
           except: metadata = {}
@@ -456,6 +474,7 @@ jobs:
             year = metadata.get('year') or datetime.datetime.now().year
             lang = metadata.get('lang') or 'pt'
             queued = failed_meta = failed_post = skipped = 0
+            auth_fails = 0   # 401/403 seguidos — ver abort abaixo
 
             for n, vid in enumerate(ids, start=1):
               watch_url = f"https://www.youtube.com/watch?v={vid}"
@@ -483,11 +502,11 @@ jobs:
                 print(f"  → [{n}/{len(ids)}] {vid}: live_status={info.get('live_status')} — ignorado (não é um vídeo pronto)")
                 time.sleep(1); continue
 
-              title = info['title'].strip()
+              title = swap_filme(info['title'].strip())
               # Teto de 4000 chars: o payload total dos inputs do workflow_dispatch
               # (metadata vai lá dentro) tem limite de 65535 no GitHub — descrições
               # longas de YouTube nunca podem fazer o disparo falhar com 422.
-              description = ((info.get('description') or '').strip() or title)[:4000]
+              description = (swap_filme((info.get('description') or '').strip()) or title)[:4000]
 
               # 3) Enfileira no lote F — mesmo formato de body que o ingest e
               # o batching de playlist já usam. thumbnail_url vazio de
@@ -507,12 +526,27 @@ jobs:
               }
               req = urllib.request.Request(
                 f"{worker_base}/upload-event", data=json.dumps(body).encode(),
-                headers={'Content-Type': 'application/json', 'x-api-key': worker_key},
+                headers={'Content-Type': 'application/json', 'x-api-key': worker_key,
+                         # UA próprio: o default do urllib ("Python-urllib/3.x") é
+                         # bloqueado com 403 pelo firewall da Cloudflare à frente do
+                         # worker (o código do worker nunca devolve 403 — chave errada
+                         # dá 401). O browser do ingest nunca teve este problema.
+                         'User-Agent': 'streamvault-runner/1.0'},
                 method='POST')
               try:
                 with urllib.request.urlopen(req, timeout=20) as resp:
-                  queued += 1
+                  queued += 1; auth_fails = 0
                   print(f"  ✓ [{n}/{len(ids)}] {vid} enfileirado no lote F (HTTP {resp.status}): {title[:70]}")
+              except urllib.error.HTTPError as ex:
+                failed_post += 1
+                detail = ex.read().decode('utf-8', 'replace').replace('\n', ' ')[:200]
+                print(f"  ✗ [{n}/{len(ids)}] {vid}: falha ao enfileirar (HTTP {ex.code}) — resposta: {detail!r} — este vídeo NÃO entrou na fila")
+                auth_fails = auth_fails + 1 if ex.code in (401, 403) else 0
+                if auth_fails >= 3:
+                  raise SystemExit(f"ERRO: 3 respostas HTTP {ex.code} seguidas do worker do lote F — a parar em vez de "
+                                   f"repetir centenas de pedidos. 401 = LOTE_F_WORKER_KEY diferente do WORKER_API_KEY do worker; "
+                                   f"403 vindo da Cloudflare (ver o corpo acima) = pedido barrado antes de chegar ao worker; "
+                                   f"confirma também que LOTE_F_WORKER_BASE é o URL do worker (sem barra final nem caminho).")
               except Exception as ex:
                 failed_post += 1
                 print(f"  ✗ [{n}/{len(ids)}] {vid}: falha ao enfileirar ({ex}) — este vídeo NÃO entrou na fila")
@@ -681,7 +715,8 @@ jobs:
               }
               req = urllib.request.Request(
                 f"{worker_base}/upload-event", data=json.dumps(body).encode(),
-                headers={'Content-Type': 'application/json', 'x-api-key': worker_key},
+                headers={'Content-Type': 'application/json', 'x-api-key': worker_key,
+                         'User-Agent': 'streamvault-runner/1.0'},
                 method='POST')
               try:
                 with urllib.request.urlopen(req, timeout=15) as resp:
