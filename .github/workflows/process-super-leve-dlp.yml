@@ -85,7 +85,7 @@ name: StreamVault Process (Super Leve DLP)
 # ═══════════════════════════════════════════════════════════════════════
 #
 # ═══════════════════════════════════════════════════════════════════════
-# RONDA "THUMBNAILS SEM FRAME" (esta edição) — resumo:
+# RONDA "THUMBNAILS SEM FRAME" — resumo:
 #
 # Extração de frame via ffmpeg (fallback antigo, tanto no modo vídeo
 # único quanto no modo playlist) foi REMOVIDA por completo — não existe
@@ -98,8 +98,8 @@ name: StreamVault Process (Super Leve DLP)
 #      (curl genérico, sem restrição de domínio — nunca foi restrito a
 #      YT, isso já era assim antes desta ronda).
 #   2. Se vazio, OU se o download da URL fornecida falhar/vier
-#      inválido: fallback pra thumbnail nativa do YouTube, em cascata
-#      de qualidade decrescente — maxresdefault → sddefault →
+#      inválido: fallback pra thumbnail nativa do YouTube, em cascata de
+#      qualidade decrescente — maxresdefault → sddefault →
 #      hqdefault → mqdefault → default. As 3 últimas praticamente
 #      sempre existem (ao contrário de maxresdefault, que falha pra
 #      vídeos antigos/verticais) — isso garante cobertura quase total
@@ -134,6 +134,57 @@ name: StreamVault Process (Super Leve DLP)
 # nenhuma alteração: ambos já eram pass-through puro do campo
 # thumbnail_url (confirmado por leitura de código), sem qualquer
 # validação/restrição de plataforma.
+# ═══════════════════════════════════════════════════════════════════════
+#
+# ═══════════════════════════════════════════════════════════════════════
+# RONDA "MINI SÉRIES (CANAL DO YOUTUBE)" (esta edição) — resumo:
+#
+# type=series passa a aceitar TAMBÉM a URL de uma página de canal do
+# YouTube (ex.: https://www.youtube.com/@Handle/videos, ou /channel/UC…,
+# /c/…, /user/…, com ou sem o sufixo /videos), além de playlist (?list=).
+# Três casos, decididos no step "Detectar playlist e decidir batch"
+# olhando SÓ pra URL (nenhum input novo — continuam 9, limite de 10):
+#
+#   1. URL de PLAYLIST (tem ?list=)  → fluxo de série de sempre, INALTERADO.
+#   2. URL de CANAL                  → este job vira um "coordinator" leve
+#      (IS_CHANNEL=true): NÃO baixa/encoda nada. Lista os vídeos do canal
+#      (yt-dlp --flat-playlist), e pra cada um extrai título, descrição
+#      (yt-dlp --skip-download --print, um vídeo de cada vez) e envia um
+#      POST /upload-event ao worker do lote F — exactamente o mesmo
+#      mecanismo/credenciais que o batching de playlist já usa
+#      (LOTE_F_WORKER_BASE/KEY, nenhuma env nova). Entram na FILA
+#      pendente do lote F (nunca abrem janela por si sós); quem dispara é
+#      o cron 08h ou o botão "Disparar agora", e a fila já garante
+#      concorrência=1 e o gap aleatório. Ordem: do MAIS ANTIGO pro mais
+#      novo (o /videos do YouTube lista o mais novo primeiro — invertido
+#      aqui pra que, ao registar, o vídeo mais recente do canal seja o
+#      último a entrar e fique no topo do catálogo "mais recentes").
+#      Todos os steps pesados deste ficheiro ganharam
+#      `&& env.IS_CHANNEL != 'true'` e ficam saltados neste modo.
+#   3. URL de VÍDEO ÚNICO (watch?v=, youtu.be, shorts…) com type=series →
+#      "série singular": é o que cada vídeo enfileirado pelo coordinator
+#      acima é. Corre o pipeline de vídeo único de sempre (sem sondar
+#      playlist), regista type='series' SEM seasonNumber/episodeNumber —
+#      o backend (registerContent) só cria temporada/episódio quando esses
+#      dois campos vêm preenchidos, por isso fica um conteúdo singular,
+#      como as Animações. Nenhuma alteração no backend.
+#
+# MARCADOR: cada vídeo enfileirado leva metadata.genres=['miniserie'] e o
+# registo do vídeo único agora envia `genres` (antes não enviava — o
+# backend já gravava `genres || []`, então pra todo o resto continua a
+# gravar [] exactamente como antes). O frontend usa esse género pra
+# distinguir mini série (card horizontal, carrossel "Tendências") de
+# série clássica com temporadas/episódios (card vertical). A constante
+# CHANNEL_SERIES_GENRE tem de ser igual à de frontend_web/src/lib/
+# channelSeries.ts.
+#
+# Título/descrição/thumbnail: título e descrição vêm do yt-dlp de cada
+# vídeo (a descrição cai pro título se o vídeo não tiver nenhuma); a
+# thumbnail NÃO é enviada pelo coordinator — cada vídeo enfileirado usa a
+# cadeia normal (thumbnail nativa do YouTube i.ytimg.com, maxresdefault →
+# … → default, pelo videoId real), exactamente o que já existia. A
+# thumbnail_url do ingest é IGNORADA neste modo de propósito (senão todos
+# os vídeos do canal ficariam com a mesma capa).
 # ═══════════════════════════════════════════════════════════════════════
 
 on:
@@ -242,6 +293,12 @@ jobs:
       # vem depois só lê IS_PLAYLIST/PLAYLIST_ITEMS_EFFECTIVE, escritos
       # aqui. Também persiste $WORK_DIR/playlist_ids.json (índice→videoId)
       # pra alimentar o fallback de thumbnail por episódio mais adiante.
+      #
+      # RONDA "MINI SÉRIES": pra type=series este step também reconhece
+      # URL de canal (vira coordinator: IS_CHANNEL=true, enfileira cada
+      # vídeo do canal no lote F e termina) e URL de vídeo único (série
+      # singular: IS_PLAYLIST=false, pipeline de vídeo único). Ver o
+      # resumo no cabeçalho do ficheiro.
       # ═══════════════════════════════════════════════════════════════════
       - name: Detectar playlist e decidir batch (série/anime)
         env:
@@ -263,7 +320,13 @@ jobs:
           fi
 
           python3 << 'PYEOF'
-          import os, json, subprocess, urllib.request
+          import os, json, re, time, datetime, subprocess, urllib.request
+          from urllib.parse import urlparse, parse_qs
+
+          # Marcador de "mini série" (vídeo de canal, type=series sem
+          # temporada/episódio) — TEM de ser igual a CHANNEL_SERIES_GENRE em
+          # frontend_web/src/lib/channelSeries.ts.
+          CHANNEL_SERIES_GENRE = 'miniserie'
 
           try:    metadata = json.loads(os.environ.get('INPUT_METADATA', '') or '{}')
           except: metadata = {}
@@ -292,6 +355,39 @@ jobs:
           if os.path.exists('/tmp/cookies.txt'):
             cookie_args = ['--cookies', '/tmp/cookies.txt']
 
+          # Classifica a URL só pra type=series (RONDA "MINI SÉRIES"):
+          #   'playlist'        → tem ?list= (ou /playlist) — fluxo de série de sempre
+          #   'video'           → watch?v= / youtu.be / shorts / embed / live SEM list=
+          #   'channel'         → /@handle, /channel/…, /c/…, /user/… (raiz ou /videos)
+          #   'channel_bad_tab' → canal, mas noutra aba (/shorts, /streams, /playlists…)
+          #   'other'           → qualquer outra coisa — segue o fluxo de sempre
+          def classify_series_url(url):
+            try:
+              u = urlparse((url or '').strip())
+            except Exception:
+              return 'other'
+            host = (u.hostname or '').lower()
+            for prefix in ('www.', 'm.'):
+              if host.startswith(prefix):
+                host = host[len(prefix):]
+            q     = parse_qs(u.query)
+            parts = [p for p in u.path.split('/') if p]
+            if q.get('list'):
+              return 'playlist'
+            if host == 'youtu.be':
+              return 'video' if parts else 'other'
+            if host == 'youtube.com' and parts:
+              first = parts[0]
+              if first == 'playlist':
+                return 'playlist'
+              if first in ('watch', 'shorts', 'embed', 'live'):
+                return 'video'
+              if first.startswith('@') or first in ('channel', 'c', 'user'):
+                base_len = 1 if first.startswith('@') else 2
+                tab = parts[base_len] if len(parts) > base_len else None
+                return 'channel' if tab in (None, 'videos') else 'channel_bad_tab'
+            return 'other'
+
           # Qualquer tipo que não seja anime/series segue a regra "video":
           # 1 link = 1 vídeo = 1 job — pipeline de sempre, sem tocar em
           # nada. Cobre movie/documentary/dorama e os tipos antigos
@@ -299,6 +395,133 @@ jobs:
           if content_type not in ('anime', 'series'):
             write_env({'IS_PLAYLIST': 'false', 'PLAYLIST_ITEMS_EFFECTIVE': ''})
             print(f"→ type={content_type}: fluxo de vídeo único (sem playlist) — pipeline inalterado")
+            raise SystemExit(0)
+
+          url_kind = classify_series_url(video_url) if content_type == 'series' else 'other'
+
+          # ── MINI SÉRIES — série singular: um vídeo único com type=series.
+          # É o que cada vídeo enfileirado pelo coordinator de canal (abaixo)
+          # é. Pipeline de vídeo único de sempre; o registo não leva
+          # seasonNumber/episodeNumber, logo o backend cria conteúdo
+          # singular (sem temporada/episódio). Sem sondar playlist.
+          if url_kind == 'video':
+            write_env({'IS_PLAYLIST': 'false', 'PLAYLIST_ITEMS_EFFECTIVE': ''})
+            print("→ type=series com URL de vídeo único: série singular (mini série) — pipeline de vídeo único, sem sondar playlist")
+            raise SystemExit(0)
+
+          # ── MINI SÉRIES — coordinator de canal. NÃO baixa/encoda nada:
+          # lista os vídeos do canal, extrai título/descrição de cada um e
+          # enfileira cada vídeo no lote F (POST /upload-event — só entra na
+          # fila pendente, nunca abre janela). Os steps pesados abaixo ficam
+          # saltados por IS_CHANNEL=true.
+          if url_kind in ('channel', 'channel_bad_tab'):
+            write_env({'IS_PLAYLIST': 'false', 'IS_CHANNEL': 'true', 'PLAYLIST_ITEMS_EFFECTIVE': ''})
+
+            u = urlparse(video_url.strip())
+            parts = [p for p in u.path.split('/') if p]
+            base_len = 1 if parts[0].startswith('@') else 2
+            if url_kind == 'channel_bad_tab':
+              raise SystemExit(f"ERRO: URL de canal numa aba não suportada ('{parts[base_len]}'). "
+                               f"Use a raiz do canal ou a aba /videos — ex.: https://www.youtube.com/{'/'.join(parts[:base_len])}/videos")
+
+            worker_base = os.environ.get('LOTE_F_WORKER_BASE', '').rstrip('/')
+            worker_key  = os.environ.get('LOTE_F_WORKER_KEY', '')
+            if not worker_base:
+              raise SystemExit("ERRO: LOTE_F_WORKER_BASE/LOTE_F_WORKER_KEY não configurados neste repo — "
+                               "sem eles o coordinator de canal não consegue enfileirar nada. Configure os "
+                               "secrets com o MESMO valor já usado em WORKER_BASE/WORKER_KEY do ingest-novo.js.")
+
+            channel_url = 'https://www.youtube.com/' + '/'.join(parts[:base_len]) + '/videos'
+            print(f"→ type=series com URL de canal: modo coordinator — {channel_url}")
+
+            # 1) Lista dos vídeos (rápido, não baixa nada). O ordem do
+            # YouTube é mais novo primeiro; inverte pra enfileirar do mais
+            # antigo pro mais novo (ver cabeçalho).
+            ls = subprocess.run(
+              ['yt-dlp', '--flat-playlist', '--ignore-errors', '--no-warnings',
+               '--remote-components', 'ejs:github', *cookie_args,
+               '--print', '%(id)s', channel_url],
+              capture_output=True, text=True, timeout=900)
+            ids, seen = [], set()
+            for line in ls.stdout.splitlines():
+              vid = line.strip()
+              if re.fullmatch(r'[A-Za-z0-9_-]{11}', vid) and vid not in seen:
+                seen.add(vid); ids.append(vid)
+            if not ids:
+              raise SystemExit(f"ERRO: nenhum vídeo encontrado em {channel_url} "
+                               f"(rc={ls.returncode}): {ls.stderr.strip()[:400]}")
+            ids.reverse()
+            print(f"✓ {len(ids)} vídeo(s) no canal — a enfileirar do mais antigo pro mais novo")
+
+            year = metadata.get('year') or datetime.datetime.now().year
+            lang = metadata.get('lang') or 'pt'
+            queued = failed_meta = failed_post = skipped = 0
+
+            for n, vid in enumerate(ids, start=1):
+              watch_url = f"https://www.youtube.com/watch?v={vid}"
+
+              # 2) Metadados desse vídeo (um yt-dlp por vídeo, sem download).
+              info = None
+              try:
+                r = subprocess.run(
+                  ['yt-dlp', '--skip-download', '--no-warnings', '--no-playlist',
+                   '--ignore-no-formats-error', '--remote-components', 'ejs:github', *cookie_args,
+                   '--print', '%(.{id,title,description,live_status})j', watch_url],
+                  capture_output=True, text=True, timeout=180)
+                for line in reversed(r.stdout.splitlines()):
+                  line = line.strip()
+                  if line.startswith('{'):
+                    info = json.loads(line); break
+              except Exception as ex:
+                print(f"  ✗ [{n}/{len(ids)}] {vid}: falha ao extrair metadados ({ex}) — ignorado")
+              if not info or not (info.get('title') or '').strip():
+                failed_meta += 1
+                print(f"  ✗ [{n}/{len(ids)}] {vid}: sem título/metadados (privado, só-membros ou indisponível) — ignorado")
+                time.sleep(1); continue
+              if info.get('live_status') in ('is_live', 'is_upcoming', 'post_live'):
+                skipped += 1
+                print(f"  → [{n}/{len(ids)}] {vid}: live_status={info.get('live_status')} — ignorado (não é um vídeo pronto)")
+                time.sleep(1); continue
+
+              title = info['title'].strip()
+              # Teto de 4000 chars: o payload total dos inputs do workflow_dispatch
+              # (metadata vai lá dentro) tem limite de 65535 no GitHub — descrições
+              # longas de YouTube nunca podem fazer o disparo falhar com 422.
+              description = ((info.get('description') or '').strip() or title)[:4000]
+
+              # 3) Enfileira no lote F — mesmo formato de body que o ingest e
+              # o batching de playlist já usam. thumbnail_url vazio de
+              # propósito: cada vídeo usa a cadeia de thumbnail do YouTube
+              # pelo seu próprio videoId (ver cabeçalho).
+              body = {
+                'job_id': f"{job_id}-{vid}",
+                'video_url': watch_url,
+                'metadata': {
+                  'contentId': vid, 'title': title, 'description': description,
+                  'type': 'series', 'year': year, 'lang': lang,
+                  'genres': [CHANNEL_SERIES_GENRE],
+                },
+                'thumbnail_url': '',
+                'seg_duration': os.environ.get('SEG_DURATION', '4'),
+                'max_encode_height': os.environ.get('MAX_H', '720'),
+              }
+              req = urllib.request.Request(
+                f"{worker_base}/upload-event", data=json.dumps(body).encode(),
+                headers={'Content-Type': 'application/json', 'x-api-key': worker_key},
+                method='POST')
+              try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                  queued += 1
+                  print(f"  ✓ [{n}/{len(ids)}] {vid} enfileirado no lote F (HTTP {resp.status}): {title[:70]}")
+              except Exception as ex:
+                failed_post += 1
+                print(f"  ✗ [{n}/{len(ids)}] {vid}: falha ao enfileirar ({ex}) — este vídeo NÃO entrou na fila")
+              time.sleep(1)
+
+            print(f"── Resumo do canal: {queued} enfileirado(s), {skipped} ignorado(s) (live), "
+                  f"{failed_meta} sem metadados, {failed_post} falha(s) ao enfileirar, de {len(ids)} vídeo(s)")
+            if queued == 0:
+              raise SystemExit("ERRO: nenhum vídeo do canal foi enfileirado.")
             raise SystemExit(0)
 
           write_env({'IS_PLAYLIST': 'true'})
@@ -477,7 +700,7 @@ jobs:
       # ═══════════════════════════════════════════════════════════════════
 
       - name: Descarregar vídeo (yt-dlp)
-        if: env.IS_PLAYLIST != 'true'
+        if: env.IS_PLAYLIST != 'true' && env.IS_CHANNEL != 'true'
         env:
           VIDEO_URL: ${{ inputs.video_url }}
           # Opcional: cookies de sessão em formato Netscape, se o canal
@@ -596,7 +819,7 @@ jobs:
           PYEOF
 
       - name: Probe do vídeo
-        if: env.IS_PLAYLIST != 'true'
+        if: env.IS_PLAYLIST != 'true' && env.IS_CHANNEL != 'true'
         run: |
           ffprobe -v quiet -print_format json -show_streams -show_format "$VIDEO_PATH" > "$WORK_DIR/probe.json"
           python3 << 'PYEOF'
@@ -652,7 +875,7 @@ jobs:
           PYEOF
 
       - name: HLS encode (stream copy se h264 nativo, senão libx264 ultrafast CRF26)
-        if: env.IS_PLAYLIST != 'true'
+        if: env.IS_PLAYLIST != 'true' && env.IS_CHANNEL != 'true'
         run: |
           HLS_DIR="$WORK_DIR/hls"
           GOP=$(python3 -c "import math; print(int(math.ceil(${PROBE_FPS} * ${SEG_DURATION})))")
@@ -714,7 +937,7 @@ jobs:
       # Se nada disso resolver, o item fica sem thumbnail.
       # ═══════════════════════════════════════════════════════════════════
       - name: Obter thumbnail
-        if: env.IS_PLAYLIST != 'true'
+        if: env.IS_PLAYLIST != 'true' && env.IS_CHANNEL != 'true'
         env:
           INPUT_THUMBNAIL_URL: ${{ inputs.thumbnail_url }}
         run: |
@@ -796,7 +1019,7 @@ jobs:
           PYEOF
 
       - name: Encriptar segmentos → .bin
-        if: env.IS_PLAYLIST != 'true'
+        if: env.IS_PLAYLIST != 'true' && env.IS_CHANNEL != 'true'
         run: |
           python3 << 'PYEOF'
           import os, json, secrets, struct
@@ -1153,6 +1376,7 @@ jobs:
       # ═══════════════════════════════════════════════════════════════════
 
       - name: Gerar token de instalação da App (conta de storage)
+        if: env.IS_CHANNEL != 'true'
         env:
           STORAGE_OWNER:           ${{ secrets.STORAGE_OWNER }}
           STORAGE_APP_ID:          ${{ secrets.STORAGE_APP_ID }}
@@ -1199,6 +1423,7 @@ jobs:
           PYEOF
 
       - name: Definir branch exclusiva do job
+        if: env.IS_CHANNEL != 'true'
         run: |
           python3 << 'PYEOF'
           import os, re
@@ -1211,7 +1436,7 @@ jobs:
           PYEOF
 
       - name: Escolher shard, gerar URLs e enviar (com fallback automático de shard cheio)
-        if: env.IS_PLAYLIST != 'true'
+        if: env.IS_PLAYLIST != 'true' && env.IS_CHANNEL != 'true'
         env:
           STORAGE_TOKEN: ${{ env.STORAGE_TARGET_TOKEN }}
           STORAGE_OWNER: ${{ env.STORAGE_TARGET_OWNER }}
@@ -1663,7 +1888,7 @@ jobs:
           PYEOF
 
       - name: Registar no EdgeOne (Turso + KV)
-        if: env.IS_PLAYLIST != 'true'
+        if: env.IS_PLAYLIST != 'true' && env.IS_CHANNEL != 'true'
         continue-on-error: true
         env:
           METADATA:      ${{ inputs.metadata }}
@@ -1712,6 +1937,10 @@ jobs:
             'encrypted':True,'encryption':'chacha20-chunk-v2','container':'fmp4','segExt':'bin',
             'masterUrl':f"{raw_base}/master.m3u8",'noncesUrl':f"{raw_base}/nonces.json",
             'storageRepo': shard_repo, 'storageOwner': storage_owner, 'storageBranch': job_branch,
+            # RONDA "MINI SÉRIES": marcador de mini série (ver cabeçalho).
+            # Sem metadata.genres (todos os outros tipos) segue [], que é
+            # exactamente o que o backend já gravava (`genres || []`).
+            'genres': metadata.get('genres') or [],
           }
           payload = json.dumps(body).encode()
           for attempt in range(1, 6):
