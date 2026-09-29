@@ -475,6 +475,11 @@ jobs:
             lang = metadata.get('lang') or 'pt'
             queued = failed_meta = failed_post = skipped = 0
             auth_fails = 0   # 401/403 seguidos — ver abort abaixo
+            # Diagnóstico da fila: o worker devolve `position` (= tamanho do array
+            # `pending` depois deste push). Numa fila saudável e sem mais nada a
+            # mexer nela sobe de 1 em 1; um salto/queda sugere escrita perdida no KV
+            # (o worker faz ler→acrescentar→regravar num único registo KV).
+            last_pos = None; pos_warn = 0
 
             for n, vid in enumerate(ids, start=1):
               watch_url = f"https://www.youtube.com/watch?v={vid}"
@@ -535,8 +540,17 @@ jobs:
                 method='POST')
               try:
                 with urllib.request.urlopen(req, timeout=20) as resp:
+                  raw = resp.read().decode('utf-8', 'replace')
                   queued += 1; auth_fails = 0
-                  print(f"  ✓ [{n}/{len(ids)}] {vid} enfileirado no lote F (HTTP {resp.status}): {title[:70]}")
+                  try:    pos = int(json.loads(raw).get('position'))
+                  except Exception: pos = None
+                  pos_note = ''
+                  if pos is not None:
+                    if last_pos is not None and pos != last_pos + 1:
+                      pos_warn += 1
+                      pos_note = f" ⚠ posição inesperada (esperado {last_pos + 1})"
+                    last_pos = pos
+                  print(f"  ✓ [{n}/{len(ids)}] {vid} enfileirado no lote F (HTTP {resp.status}, posição {pos}){pos_note}: {title[:70]}")
               except urllib.error.HTTPError as ex:
                 failed_post += 1
                 detail = ex.read().decode('utf-8', 'replace').replace('\n', ' ')[:200]
@@ -554,6 +568,18 @@ jobs:
 
             print(f"── Resumo do canal: {queued} enfileirado(s), {skipped} ignorado(s) (live), "
                   f"{failed_meta} sem metadados, {failed_post} falha(s) ao enfileirar, de {len(ids)} vídeo(s)")
+            # Confronto final com o que o worker diz ter na fila (GET /status é
+            # público no worker). Pode incluir itens que já lá estavam e pode vir
+            # ligeiramente desfasado (KV eventualmente consistente) — serve de
+            # evidência, não de veredicto.
+            try:
+              rs = urllib.request.Request(f"{worker_base}/status", headers={'User-Agent': 'streamvault-runner/1.0'})
+              with urllib.request.urlopen(rs, timeout=15) as r2:
+                st = json.loads(r2.read().decode('utf-8', 'replace'))
+              print(f"── Fila do lote F segundo o worker: pending={st.get('pending')} | enfileirados por este job: {queued} | "
+                    f"última posição devolvida: {last_pos} | saltos de posição: {pos_warn}")
+            except Exception as ex:
+              print(f"⚠ Não foi possível ler {worker_base}/status pra confrontar a fila ({ex})")
             if queued == 0:
               raise SystemExit("ERRO: nenhum vídeo do canal foi enfileirado.")
             raise SystemExit(0)
