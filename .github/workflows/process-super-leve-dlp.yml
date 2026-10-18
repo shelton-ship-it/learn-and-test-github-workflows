@@ -109,24 +109,45 @@ jobs:
           if [ -n "$YTDLP_COOKIES" ]; then
             echo "$YTDLP_COOKIES" > /tmp/cookies.txt
             COOKIE_ARGS=(--cookies /tmp/cookies.txt)
+            echo "✓ Cookies carregados ($(wc -l < /tmp/cookies.txt) linhas)"
+          else
+            echo "⚠ YTDLP_COOKIES vazio/inexistente — a tentar sem cookies (IPs do GitHub costumam ser bloqueados)"
           fi
 
-          # -S: prioriza h264 (toca inline no Telegram), depois a maior
-          # resolução, depois aac. Sem limite de altura.
-          yt-dlp \
-            "${COOKIE_ARGS[@]}" \
-            --remote-components ejs:github \
-            -S "vcodec:h264,res,acodec:aac,ext:mp4:m4a" \
-            -f "bv*+ba/b" \
-            --merge-output-format mp4 \
-            --retries 5 \
-            --fragment-retries 5 \
-            --sleep-requests 1 \
-            --no-playlist \
-            --print-to-file "%(id)s"    "$WORK_DIR/video_id.txt" \
-            --print-to-file "%(title)s" "$WORK_DIR/video_title.txt" \
-            -o "$WORK_DIR/incoming/input.%(ext)s" \
-            "$VIDEO_URL"
+          # Tenta vários clientes do YouTube em sequência: o bloqueio
+          # costuma afectar só alguns. "" = cliente por defeito do yt-dlp.
+          OK=0
+          for CLIENT in "" "youtube:player_client=mweb" "youtube:player_client=web_safari" "youtube:player_client=tv"; do
+            echo "════ Tentativa com cliente: ${CLIENT:-default} ════"
+            EXTRA=()
+            if [ -n "$CLIENT" ]; then EXTRA=(--extractor-args "$CLIENT"); fi
+            rm -rf "$WORK_DIR/incoming" && mkdir -p "$WORK_DIR/incoming"
+
+            # -S: prioriza h264 (toca inline no Telegram), depois a maior
+            # resolução, depois aac. Sem limite de altura.
+            if yt-dlp \
+                "${COOKIE_ARGS[@]}" "${EXTRA[@]}" \
+                --remote-components ejs:github \
+                -S "vcodec:h264,res,acodec:aac,ext:mp4:m4a" \
+                -f "bv*+ba/b" \
+                --merge-output-format mp4 \
+                --retries 5 \
+                --fragment-retries 5 \
+                --sleep-requests 1 \
+                --no-playlist \
+                --print-to-file "%(id)s"    "$WORK_DIR/video_id.txt" \
+                --print-to-file "%(title)s" "$WORK_DIR/video_title.txt" \
+                -o "$WORK_DIR/incoming/input.%(ext)s" \
+                "$VIDEO_URL"; then
+              OK=1; break
+            fi
+            echo "⚠ Cliente ${CLIENT:-default} falhou — a tentar o próximo"
+          done
+
+          if [ "$OK" != "1" ]; then
+            echo "✗ Todos os clientes falharam. Causa provável: IP do runner bloqueado — renova o secret YTDLP_COOKIES (cookies frescos, de sessão anónima/privada exportada)."
+            exit 1
+          fi
 
           VIDEO_PATH=$(find "$WORK_DIR/incoming/" -type f | head -1)
           if [ -z "$VIDEO_PATH" ]; then
