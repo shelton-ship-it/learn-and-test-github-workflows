@@ -182,10 +182,8 @@ jobs:
 
           rm -rf "$WORK_DIR/incoming"   # libertar espaço
 
-          read W H DUR < <(ffprobe -v error -select_streams v:0 \
-            -show_entries stream=width,height -show_entries format=duration \
-            -of csv=p=0:s=' ' "$OUT" | tr '\n' ' ' | awk '{print $1, $2, $3}')
-          # format=duration vem noutra linha; garante valor mesmo assim
+          W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width  -of csv=p=0 "$OUT")
+          H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT")
           DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT")
           SIZE=$(stat -c%s "$OUT")
 
