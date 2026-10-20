@@ -444,7 +444,6 @@ jobs:
           # Supergrupo com Tópicos: 1 tópico por pasta (criado se não existir).
           # Canal normal (sem tópicos): cai para uma #hashtag na legenda.
           import re, random
-          from telethon.tl.functions.channels import GetForumTopicsRequest, CreateForumTopicRequest
 
           TYPE_LABELS = {'movie':'Filmes','documentary':'Documentários','dorama':'Animações',
                          'series':'Séries','anime':'Animes','rain':'Chuva','relaxation':'Relaxamento',
@@ -459,20 +458,22 @@ jobs:
           async def place(client, chat, name):
             """(é_fórum, topic_id). Falha → (False, None): envia sem pasta, com hashtag."""
             try:
+              # Os requests de tópicos vivem em telethon.tl.functions.MESSAGES (não em channels).
+              from telethon.tl.functions.messages import GetForumTopicsRequest, CreateForumTopicRequest
               ent = await client.get_entity(chat)
               if not getattr(ent, 'forum', False):
                 return False, None
               if name in topic_cache:
                 return True, topic_cache[name]
               async def find():
-                res = await client(GetForumTopicsRequest(channel=ent, offset_date=None, offset_id=0,
+                res = await client(GetForumTopicsRequest(peer=ent, offset_date=None, offset_id=0,
                                                          offset_topic=0, limit=100, q=name))
                 for t in res.topics:
                   if getattr(t, 'title', None) == name: return t.id
                 return None
               tid = await find()
               if tid is None:
-                await client(CreateForumTopicRequest(channel=ent, title=name,
+                await client(CreateForumTopicRequest(peer=ent, title=name,
                                                      random_id=random.randrange(1, 2**62)))
                 await asyncio.sleep(1)
                 tid = await find()
