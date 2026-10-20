@@ -486,6 +486,34 @@ jobs:
 
           folder_name = ((metadata.get('folder') or '').strip() or TYPE_LABELS.get(ctype, 'Vídeos'))[:128]
 
+          async def preflight(client, chat):
+            """Falha em segundos se o bot não puder escrever — ANTES de gastar o upload."""
+            ent = await client.get_entity(chat)
+            kind = 'fórum' if getattr(ent, 'forum', False) else ('canal' if getattr(ent, 'broadcast', False) else 'grupo')
+            me = await client.get_me()
+            is_admin = can_post = None
+            try:
+              perm = await client.get_permissions(ent, me)
+              is_admin = bool(perm.is_admin)
+              can_post = bool(getattr(perm, 'post_messages', False))
+            except Exception as ex:
+              print(f"  🔎 não consegui ler as permissões do bot ({type(ex).__name__}) — provavelmente não é membro/admin")
+            dbr = getattr(ent, 'default_banned_rights', None)
+            media_blocked = bool(dbr and (dbr.send_messages or dbr.send_media or getattr(dbr, 'send_videos', False)))
+            print(f"  🔎 {kind} '{getattr(ent, 'title', chat)}' | bot=@{me.username} | admin={is_admin} | "
+                  f"mídia bloqueada p/ membros={media_blocked}")
+            problem = None
+            if kind == 'canal' and is_admin is not None and not can_post:
+              problem = "o bot não tem a permissão 'Publicar mensagens' neste canal"
+            elif kind != 'canal' and is_admin is False and media_blocked:
+              problem = "o grupo bloqueia o envio de mídia a membros e o bot não é administrador"
+            elif kind != 'canal' and is_admin is False and kind == 'fórum':
+              print("  ⚠ bot não é administrador do fórum — pode falhar a criação de tópicos")
+            if problem:
+              print(f"✗ SEM PERMISSÃO: {problem}. Corrige no Telegram (Administradores → o teu bot) e volta a correr. "
+                    f"Nada foi enviado/descarregado em vão.")
+              raise SystemExit(1)
+
           last = {'t': 0}
           def progress(sent, total):
             now = time.time()
@@ -497,6 +525,7 @@ jobs:
             client = TelegramClient(StringSession(), int(os.environ['TG_API_ID']), os.environ['TG_API_HASH'])
             await client.start(bot_token=os.environ['TG_BOT_TOKEN'])
             try:
+              await preflight(client, chat)
               is_forum, tid = await place(client, chat, folder_name)
               cap = caption if is_forum else (caption[:1000] + '\n' + tag(folder_name)).strip()
               await client.send_file(
