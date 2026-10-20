@@ -5,9 +5,10 @@ name: StreamVault Process (DLP → Telegram)
 #
 # REMOVIDO: HLS, encriptação ChaCha20, shards/push GitHub, registo no
 # EdgeOne, canal/batching, cookie self-refresh, limite de altura.
-# PLAYLIST: link de playlist (/playlist?list=) é processado um vídeo de
-# cada vez (baixa → compatibiliza → envia → apaga). playlist_items e
-# skip_first_item funcionam como no original.
+# PLAYLIST (type anime/series + link com list=): como no original, este
+# job vira coordinator — lista a playlist e enfileira CADA vídeo no lote F
+# (secrets LOTE_F_WORKER_BASE/KEY); cada um corre no seu próprio runner.
+# playlist_items filtra quais enfileirar; skip_first_item ignora o 1º.
 #
 # MANTIDO: yt-dlp + Deno, cookies opcionais, thumbnail (URL fornecida →
 # fallback nativo do YouTube), webhook do dispatcher (libertar a fila),
@@ -59,7 +60,7 @@ on:
         required: false
         default: '720'
       playlist_items:
-        description: 'Só para playlists: yt-dlp --playlist-items (ex.: 1-10). Vazio = playlist inteira.'
+        description: 'Só playlists (anime/series): yt-dlp --playlist-items (ex.: 1-10) = quais enfileirar. Vazio = todos.'
         required: false
         default: ''
       skip_first_item:
@@ -103,25 +104,37 @@ jobs:
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
           "$HOME/.deno/bin/deno" --version
 
+      # ═══════════════════════════════════════════════════════════════════
+      # PLAYLIST — como no process-super-leve-dlp.yml original: só para
+      # type anime/series; qualquer link com list= (ou /playlist) conta
+      # como playlist. Este job vira "coordinator": NÃO baixa nada, lista
+      # a playlist e enfileira CADA vídeo no lote F (POST /upload-event) —
+      # cada um corre depois no seu próprio runner, como links watch?v=
+      # simples (que caem no fluxo de vídeo único abaixo).
+      # ═══════════════════════════════════════════════════════════════════
       - name: Detectar playlist
         env:
-          VIDEO_URL: ${{ inputs.video_url }}
+          VIDEO_URL:      ${{ inputs.video_url }}
+          INPUT_METADATA: ${{ inputs.metadata }}
         run: |
           python3 << 'PYEOF'
-          import os
+          import os, json
           from urllib.parse import urlparse, parse_qs
+          try:    metadata = json.loads(os.environ.get('INPUT_METADATA', '') or '{}')
+          except Exception: metadata = {}
+          ctype = (metadata.get('type') or 'video').strip().lower()
           u    = urlparse(os.environ['VIDEO_URL'].strip())
           q    = parse_qs(u.query)
-          host = (u.hostname or '').lower()
           path = u.path.rstrip('/')
-          # playlist = /playlist?list=... OU link com list= SEM v= (youtu.be/ID?list= é vídeo)
-          is_pl = (path == '/playlist') or (bool(q.get('list')) and not q.get('v') and host != 'youtu.be')
+          has_list = bool(q.get('list')) or path == '/playlist'
+          is_pl = ctype in ('anime', 'series') and has_list
           with open(os.environ['GITHUB_ENV'], 'a') as f:
             f.write(f"IS_PLAYLIST={'true' if is_pl else 'false'}\n")
-          print("→ modo:", "PLAYLIST (um vídeo de cada vez)" if is_pl else "vídeo único")
+          print(f"→ type={ctype} | list= no link: {has_list} | modo:",
+                "PLAYLIST (coordinator: um runner por vídeo)" if is_pl else "vídeo único")
           PYEOF
 
-      - name: 'Playlist: baixar, compatibilizar e enviar (um vídeo de cada vez)'
+      - name: 'Playlist: listar e enfileirar cada vídeo no lote F'
         if: env.IS_PLAYLIST == 'true'
         env:
           VIDEO_URL:            ${{ inputs.video_url }}
@@ -130,41 +143,35 @@ jobs:
           INPUT_THUMBNAIL_URL:  ${{ inputs.thumbnail_url }}
           INPUT_PLAYLIST_ITEMS: ${{ inputs.playlist_items }}
           INPUT_SKIP_FIRST:     ${{ inputs.skip_first_item }}
-          TG_API_ID:            ${{ secrets.TG_API_ID }}
-          TG_API_HASH:          ${{ secrets.TG_API_HASH }}
-          TG_BOT_TOKEN:         ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT:              ${{ secrets.TG_CHAT }}
+          SEG_DURATION:         ${{ inputs.seg_duration }}
+          MAX_H:                ${{ inputs.max_encode_height }}
+          # MESMOS secrets que o original usava para falar com o worker do lote F
+          LOTE_F_WORKER_BASE:   ${{ secrets.LOTE_F_WORKER_BASE }}
+          LOTE_F_WORKER_KEY:    ${{ secrets.LOTE_F_WORKER_KEY }}
         run: |
           if [ -n "$YTDLP_COOKIES" ]; then
             echo "$YTDLP_COOKIES" > /tmp/cookies.txt
             echo "✓ Cookies carregados ($(wc -l < /tmp/cookies.txt) linhas)"
-          else
-            echo "⚠ YTDLP_COOKIES vazio — a tentar sem cookies"
           fi
 
           python3 << 'PYEOF'
-          import os, re, json, subprocess, asyncio, time, random, shutil
-          from telethon import TelegramClient
-          from telethon.sessions import StringSession
-          from telethon.tl.types import DocumentAttributeVideo
-
-          LIMIT  = 2_000_000_000
-          PRE    = 1_950_000_000
-          TARGET = 1_880_000_000
-
-          work      = os.environ['WORK_DIR']
-          dl_dir    = os.path.join(work, 'pl_item')
-          out_dir   = os.path.join(work, 'out');    os.makedirs(out_dir, exist_ok=True)
-          thumb_dir = os.path.join(work, 'thumbs'); os.makedirs(thumb_dir, exist_ok=True)
+          import os, re, json, time, subprocess, urllib.request, urllib.error
 
           cookie_args = ['--cookies', '/tmp/cookies.txt'] if os.path.exists('/tmp/cookies.txt') else []
           url        = os.environ['VIDEO_URL'].strip()
           items_arg  = os.environ.get('INPUT_PLAYLIST_ITEMS', '').strip()
           skip_first = os.environ.get('INPUT_SKIP_FIRST', 'false').strip().lower() == 'true'
+          thumb_url  = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
+          job_id     = os.environ['JOB_ID']
           try:    metadata = json.loads(os.environ.get('INPUT_METADATA', '') or '{}')
           except Exception: metadata = {}
           series_title = (metadata.get('title') or '').strip()
-          thumb_url    = os.environ.get('INPUT_THUMBNAIL_URL', '').strip()
+
+          worker_base = os.environ.get('LOTE_F_WORKER_BASE', '').rstrip('/')
+          worker_key  = os.environ.get('LOTE_F_WORKER_KEY', '')
+          if not worker_base:
+            raise SystemExit("ERRO: LOTE_F_WORKER_BASE/LOTE_F_WORKER_KEY não configurados — sem eles "
+                             "não é possível enfileirar os vídeos da playlist.")
 
           # ── 1. Listar a playlist (rápido, não baixa nada) ──
           cmd = ['yt-dlp', '--flat-playlist', '--ignore-errors', '--no-warnings',
@@ -184,153 +191,50 @@ jobs:
             rem = items.pop(0)
             print(f"→ skip_first_item: ignorado item {rem['index']} ({rem['id']})")
           if not items:
-            print(f"ERRO: nenhum vídeo na playlist (rc={r.returncode}): {r.stderr.strip()[:400]}")
-            raise SystemExit(1)
-          print(f"→ {len(items)} vídeo(s): {[it['index'] for it in items]}")
+            raise SystemExit(f"ERRO: nenhum vídeo na playlist (rc={r.returncode}): {r.stderr.strip()[:400]}")
+          print(f"→ {len(items)} vídeo(s) a enfileirar: {[it['index'] for it in items]}")
 
-          # ── 2. Funções (mesma lógica do modo vídeo único) ──
-          def download(vid):
-            watch = f'https://www.youtube.com/watch?v={vid}'
-            for client in ('', 'youtube:player_client=mweb', 'youtube:player_client=web_safari', 'youtube:player_client=tv'):
-              shutil.rmtree(dl_dir, ignore_errors=True); os.makedirs(dl_dir)
-              extra = ['--extractor-args', client] if client else []
-              cmd = ['yt-dlp', *cookie_args, *extra, '--remote-components', 'ejs:github',
-                     '-S', 'vcodec:h264,res,acodec:aac,ext:mp4:m4a', '-f', 'bv*+ba/b',
-                     '--merge-output-format', 'mp4', '--retries', '5', '--fragment-retries', '5',
-                     '--sleep-requests', '1', '--no-playlist',
-                     '-o', os.path.join(dl_dir, 'input.%(ext)s'), watch]
-              print(f"  → download (cliente: {client or 'default'})")
-              if subprocess.run(cmd).returncode == 0:
-                fs = [os.path.join(dl_dir, f) for f in os.listdir(dl_dir)]
-                if fs and os.path.getsize(fs[0]) > 10000: return fs[0]
-            return None
-
-          def probe(path):
-            rr = subprocess.run(['ffprobe','-v','error','-print_format','json',
-                                 '-show_streams','-show_format', path], capture_output=True, text=True)
-            d = json.loads(rr.stdout or '{}'); st = d.get('streams', [])
-            return (d, next((s for s in st if s.get('codec_type') == 'video'), None),
-                       next((s for s in st if s.get('codec_type') == 'audio'), None))
-
-          def prepare(src, idx):
-            d, v, a = probe(src)
-            if not v: raise RuntimeError('sem stream de vídeo')
-            dur  = float(d.get('format', {}).get('duration') or 0)
-            h    = int(v.get('height') or 0)
-            size = os.path.getsize(src)
-            vc, pix = v.get('codec_name'), v.get('pix_fmt', '')
-            can_copy = (vc == 'h264' and pix in ('yuv420p', 'yuvj420p'))
-            aac = (a is not None and a.get('codec_name') == 'aac')
-            out = os.path.join(out_dir, f'video_{idx}.mp4')
-
-            def shrink_vargs():
-              if dur <= 0: raise RuntimeError('duração desconhecida')
-              vbr = int(TARGET * 8 / dur) - 160_000
-              if vbr < 400_000: raise RuntimeError(f'demasiado longo p/ 2 GB ({vbr//1000} kbps)')
-              vf = ['-vf', 'scale=-2:720'] if (h > 720 and vbr < 1_800_000) else []
-              return vf + ['-c:v','libx264','-preset','veryfast','-b:v',str(vbr),
-                           '-maxrate',str(int(vbr*1.15)),'-bufsize',str(vbr*2),'-pix_fmt','yuv420p']
-
-            if size > PRE:   attempts = ['shrink']
-            elif can_copy:   attempts = ['copy', 'crf', 'shrink']
-            else:            attempts = ['crf', 'shrink']
-
-            failed_once = False
-            for mode in attempts:
-              if mode == 'copy':   vargs = ['-c:v', 'copy']
-              elif mode == 'crf':  vargs = ['-c:v','libx264','-preset','veryfast','-crf','18','-pix_fmt','yuv420p']
-              else:                vargs = shrink_vargs()
-              aargs = ['-c:a','copy'] if (aac and not failed_once) else ['-c:a','aac','-b:a','160k','-ac','2']
-              print(f"  → modo: {mode}")
-              ok = subprocess.run(['ffmpeg','-hide_banner','-loglevel','warning','-stats','-i',src,
-                                   '-map','0:v:0','-map','0:a:0?', *vargs, *aargs,
-                                   '-movflags','+faststart','-y', out]).returncode == 0
-              if ok and os.path.getsize(out) <= LIMIT: break
-              failed_once = True
-              if os.path.exists(out): os.remove(out)
-            else:
-              raise RuntimeError('não coube no limite do Telegram')
-
-            d2, v2, _ = probe(out)
-            dur2 = int(float(d2['format'].get('duration') or dur))
-            print(f"  ✓ {v2['width']}x{v2['height']} | {dur2}s | {os.path.getsize(out)//(1024*1024)} MB")
-            return out, int(v2['width']), int(v2['height']), dur2
-
-          def valid_image(p, min_bytes=100):
-            if not os.path.exists(p) or os.path.getsize(p) < min_bytes: return False
-            with open(p, 'rb') as f: hd = f.read(12)
-            return (hd[:3] == b'\xff\xd8\xff' or hd[:4] == b'\x89PNG' or hd[:4] == b'RIFF'
-                    or hd[:6] in (b'GIF87a', b'GIF89a'))
-
-          def fetch(u, dest):
-            subprocess.run(['curl','-sL','--retry','2','--max-time','15','-H','User-Agent: Mozilla/5.0','-o',dest,u],
-                           capture_output=True)
-            if valid_image(dest): return True
-            if os.path.exists(dest): os.remove(dest)
-            return False
-
-          def make_thumb(vid, idx):
-            raw = os.path.join(thumb_dir, f'raw_{idx}')
-            got = bool(thumb_url) and fetch(thumb_url, raw)       # URL única p/ todos
-            if not got:
-              for q in ('maxresdefault','sddefault','hqdefault','mqdefault','default'):
-                if fetch(f'https://i.ytimg.com/vi/{vid}/{q}.jpg', raw): got = True; break
-            if not got: return None
-            out = os.path.join(thumb_dir, f'thumb_{idx}.jpg')
-            rr = subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-y','-i',raw,
-                                 '-vf','scale=320:320:force_original_aspect_ratio=decrease','-q:v','5',out],
-                                capture_output=True)
-            return out if (rr.returncode == 0 and os.path.exists(out) and os.path.getsize(out) <= 200*1024) else None
-
-          last = {'t': 0}
-          def progress(sent, total):
-            now = time.time()
-            if now - last['t'] > 10 or sent == total:
-              last['t'] = now
-              print(f"  upload {sent*100//total}% ({sent//(1024*1024)}/{total//(1024*1024)} MB)", flush=True)
-
-          chat = os.environ['TG_CHAT'].strip()
-          chat = int(chat) if chat.lstrip('-').isdigit() else chat
-
-          # ── 3. Um vídeo de cada vez: baixar → compatibilizar → enviar → apagar ──
-          async def main():
-            client = TelegramClient(StringSession(), int(os.environ['TG_API_ID']),
-                                    os.environ['TG_API_HASH'], flood_sleep_threshold=300)
-            await client.start(bot_token=os.environ['TG_BOT_TOKEN'])
-            sent_ok, failed = [], []
+          # ── 2. Enfileirar cada vídeo no lote F (só entra na fila pendente;
+          # quem dispara é o cron/botão do lote, com concorrência=1 e gap) ──
+          queued = failed = auth_fails = 0
+          for it in items:
+            watch_url = f"https://www.youtube.com/watch?v={it['id']}"
+            title = f"{series_title} — Ep. {it['index']}" if series_title else it['title']
+            body = {
+              'job_id': f"{job_id}-ep{it['index']}",
+              'video_url': watch_url,                       # link simples → fluxo de vídeo único
+              'metadata': {**metadata, 'title': title},
+              'thumbnail_url': thumb_url,
+              'seg_duration': os.environ.get('SEG_DURATION', '4'),
+              'max_encode_height': os.environ.get('MAX_H', '720'),
+            }
+            req = urllib.request.Request(
+              f"{worker_base}/upload-event", data=json.dumps(body).encode(),
+              headers={'Content-Type': 'application/json', 'x-api-key': worker_key,
+                       # UA próprio: o default do urllib é barrado (403) pelo firewall da Cloudflare
+                       'User-Agent': 'streamvault-runner/1.0'},
+              method='POST')
             try:
-              for n, it in enumerate(items, start=1):
-                print(f"════ [{n}/{len(items)}] item {it['index']} — {it['id']} ════")
-                src = out = None
-                try:
-                  src = await asyncio.to_thread(download, it['id'])
-                  if not src: raise RuntimeError('download falhou em todos os clientes')
-                  out, w, h, dur = await asyncio.to_thread(prepare, src, it['index'])
-                  thumb = await asyncio.to_thread(make_thumb, it['id'], it['index'])
-                  cap = (f"{series_title} — Ep. {it['index']}" if series_title else it['title'])[:1024]
-                  await client.send_file(
-                    chat, out, caption=cap, thumb=thumb, supports_streaming=True, force_document=False,
-                    attributes=[DocumentAttributeVideo(duration=dur, w=w, h=h, supports_streaming=True)],
-                    progress_callback=progress)
-                  sent_ok.append(it['index']); print(f"✓ item {it['index']} enviado")
-                except Exception as ex:
-                  failed.append(it['index']); print(f"✗ item {it['index']} falhou — {ex}")
-                finally:
-                  for p in (out, src):
-                    if p and os.path.exists(p):
-                      try: os.remove(p)
-                      except Exception: pass
-                shutil.rmtree(dl_dir, ignore_errors=True)
-                if n < len(items):
-                  pause = random.randint(10, 30)   # alivia o YouTube/IP do runner
-                  print(f"  … pausa de {pause}s"); await asyncio.sleep(pause)
-            finally:
-              await client.disconnect()
-            print(f"── Resumo: {len(sent_ok)} enviado(s) {sent_ok} | {len(failed)} falha(s) {failed}")
-            if not sent_ok:
-              raise SystemExit(1)
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                queued += 1; auth_fails = 0
+                print(f"  ✓ ep{it['index']} ({it['id']}) enfileirado (HTTP {resp.status}): {title[:70]}")
+            except urllib.error.HTTPError as ex:
+              failed += 1
+              detail = ex.read().decode('utf-8', 'replace').replace('\n', ' ')[:200]
+              print(f"  ✗ ep{it['index']}: HTTP {ex.code} — {detail!r} — NÃO entrou na fila")
+              auth_fails = auth_fails + 1 if ex.code in (401, 403) else 0
+              if auth_fails >= 3:
+                raise SystemExit(f"ERRO: 3 respostas HTTP {ex.code} seguidas — a parar. 401 = LOTE_F_WORKER_KEY "
+                                 f"diferente da do worker; 403 = barrado pela Cloudflare; confirma também que "
+                                 f"LOTE_F_WORKER_BASE é o URL do worker (sem barra final nem caminho).")
+            except Exception as ex:
+              failed += 1
+              print(f"  ✗ ep{it['index']}: {ex} — NÃO entrou na fila")
+            time.sleep(1)
 
-          asyncio.run(main())
+          print(f"── Resumo: {queued} enfileirado(s), {failed} falha(s), de {len(items)} vídeo(s)")
+          if queued == 0:
+            raise SystemExit("ERRO: nenhum vídeo foi enfileirado.")
           PYEOF
 
       - name: Descarregar vídeo (yt-dlp, melhor qualidade)
