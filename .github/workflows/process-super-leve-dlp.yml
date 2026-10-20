@@ -209,7 +209,7 @@ jobs:
             body = {
               'job_id': f"{job_id}-ep{it['index']}",
               'video_url': watch_url,                       # link simples → fluxo de vídeo único
-              'metadata': {**metadata, 'title': title},
+              'metadata': {**metadata, 'title': title, **({'folder': series_title} if series_title else {})},
               'thumbnail_url': thumb_url,
               'seg_duration': os.environ.get('SEG_DURATION', '4'),
               'max_encode_height': os.environ.get('MAX_H', '720'),
@@ -440,6 +440,51 @@ jobs:
           chat = os.environ['TG_CHAT'].strip()
           chat = int(chat) if chat.lstrip('-').isdigit() else chat
 
+          # ── "Pastas" no Telegram ──────────────────────────────────────────
+          # Supergrupo com Tópicos: 1 tópico por pasta (criado se não existir).
+          # Canal normal (sem tópicos): cai para uma #hashtag na legenda.
+          import re, random
+          from telethon.tl.functions.channels import GetForumTopicsRequest, CreateForumTopicRequest
+
+          TYPE_LABELS = {'movie':'Filmes','documentary':'Documentários','dorama':'Animações',
+                         'series':'Séries','anime':'Animes','rain':'Chuva','relaxation':'Relaxamento',
+                         'ai':'IA','other':'Outros','video':'Vídeos'}
+          ctype = (metadata.get('type') or 'video').strip().lower()
+          topic_cache = {}
+
+          def tag(name):
+            t = re.sub(r'\W+', '_', name, flags=re.UNICODE).strip('_')
+            return ('#' + t) if t else ''
+
+          async def place(client, chat, name):
+            """(é_fórum, topic_id). Falha → (False, None): envia sem pasta, com hashtag."""
+            try:
+              ent = await client.get_entity(chat)
+              if not getattr(ent, 'forum', False):
+                return False, None
+              if name in topic_cache:
+                return True, topic_cache[name]
+              async def find():
+                res = await client(GetForumTopicsRequest(channel=ent, offset_date=None, offset_id=0,
+                                                         offset_topic=0, limit=100, q=name))
+                for t in res.topics:
+                  if getattr(t, 'title', None) == name: return t.id
+                return None
+              tid = await find()
+              if tid is None:
+                await client(CreateForumTopicRequest(channel=ent, title=name,
+                                                     random_id=random.randrange(1, 2**62)))
+                await asyncio.sleep(1)
+                tid = await find()
+              topic_cache[name] = tid
+              print(f"  📁 pasta (tópico): {name} → id {tid}")
+              return True, tid
+            except Exception as ex:
+              print(f"  ⚠ tópico '{name}' indisponível ({ex}) — envia sem pasta")
+              return False, None
+
+          folder_name = ((metadata.get('folder') or '').strip() or TYPE_LABELS.get(ctype, 'Vídeos'))[:128]
+
           last = {'t': 0}
           def progress(sent, total):
             now = time.time()
@@ -451,8 +496,10 @@ jobs:
             client = TelegramClient(StringSession(), int(os.environ['TG_API_ID']), os.environ['TG_API_HASH'])
             await client.start(bot_token=os.environ['TG_BOT_TOKEN'])
             try:
+              is_forum, tid = await place(client, chat, folder_name)
+              cap = caption if is_forum else (caption[:1000] + '\n' + tag(folder_name)).strip()
               await client.send_file(
-                chat, video, caption=caption, thumb=thumb,
+                chat, video, caption=cap, thumb=thumb, reply_to=tid,
                 supports_streaming=True, force_document=False,
                 attributes=[DocumentAttributeVideo(duration=dur, w=w, h=h, supports_streaming=True)],
                 progress_callback=progress)
