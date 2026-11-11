@@ -26,13 +26,22 @@ from parsel import Selector
 from PIL import Image
 from scrapy.exceptions import CloseSpider, IgnoreRequest
 
+try:                                                  # Scrapy >= 2.15
+    from scrapy.utils.asyncio import run_in_thread
+except ImportError:                                   # requirements.txt aceita scrapy>=2.11
+    async def run_in_thread(func, *args, **kwargs):
+        from scrapy.utils.defer import maybe_deferred_to_future
+        from twisted.internet.threads import deferToThread
+        return await maybe_deferred_to_future(deferToThread(func, *args, **kwargs))
+
 from . import netsafe
 from .adapters import get_adapter
+from .classify import page_verdict, split_entries
 from .clients import ApiClient, WorkerClient
 from .storage import StorageUnavailable, ThumbStore
 
 BATCH_ITEMS = 100
-API_BATCH = 50                           # máx. de entradas por pedido à API (limite da pixel_service_v1)
+API_BATCH = 20                           # entradas por pedido à API (limite da pixel_service_v1: 50). 20 mantém cada pedido bem abaixo dos 30 s da função
 DEADLINE_S = 5 * 3600 + 10 * 60          # o workflow tem timeout de 345 min: termina com folga e devolve checkpoint
 HEARTBEAT_S = 60
 MAX_API_FAILURES = 5                     # lotes consecutivos que falham o registo na API (cada um já tenta 5x com espera) antes de abortar
@@ -77,6 +86,7 @@ class Job:
         self.rank_t0 = int(cp0.get('rank_t0') or time.time() * 1000)
         self.rank_pos = int(cp0.get('rank_pos') or 0)
         self.job_keys = set()          # entradas já vistas NESTE job (menus/rodapé repetem-se em todas as páginas de listagem)
+        self.ignored_keys = set()      # ligações classificadas como não-conteúdo (institucionais/artigos), contadas uma só vez
         self.cp_frozen = False         # lote falhou na API: o checkpoint deixa de avançar para o retomar daí
         self.api_batches_failed = 0
         self.api_failures = 0
@@ -160,6 +170,15 @@ class Job:
                     pass
 
     # ── lote ─────────────────────────────────────────────────────────────
+    def skip_non_content(self, entry_key, detail_url, reason):
+        """Página institucional/artigo (sem magnets e com evidência de não ser um filme): não conta como falha do job."""
+        print(f'[item] ignorado (não é conteúdo) {detail_url}: {reason}')
+        self.counts['skipped'] += 1
+        if self.dry:
+            return
+        # O worker só conhece processed|failed: registar como 'failed' fecha a página (limite de tentativas) sem a contar em failures.
+        self.failed_direct.append({'content_key': entry_key, 'detail_url': detail_url, 'state': 'failed'})
+
     def fail_direct(self, entry_key, detail_url, reason):
         print(f'[item] falhou {detail_url}: {reason}')
         self.counts['failures'] += 1
@@ -300,13 +319,14 @@ class Job:
                                       'confira o secret PIPELINE_API (sem /api no fim), a chave ADMIN_API_KEY e se a pixel_service_v1 está publicada')
                     elif self.api_failures >= MAX_API_FAILURES:
                         self.fatal = f'API do catálogo indisponível: {msg}'
-                    # este bloco e, se o job vai abortar, os que não chegaram a ser enviados: por processar (não "falhados")
-                    pending = part + (sum(parts[k + 1:], []) if self.fatal else [])
+                    # Este lote e TODOS os que ainda não foram enviados ficam por processar (não "falhados"). Não insistimos nos
+                    # restantes: o lote que falhou já esgotou os retries com backoff, e com lotes pequenos cada um custaria
+                    # outra ronda completa de retries com a API em baixo. O job repete-os a partir do checkpoint congelado.
+                    pending = part + sum(parts[k + 1:], [])
                     ids = {en['item']['id'] for en in pending}
                     infra |= ids
                     errors.update({i: msg for i in ids})
-                    if self.fatal:
-                        break
+                    break
             for b, r in ready:
                 if r['catalog_id'] in errors:
                     self.counts['failures'] += 1
@@ -530,10 +550,20 @@ class CatalogSpider(scrapy.Spider):
         raise CloseSpider('listing_error')
 
     # ── listagem ─────────────────────────────────────────────────────────
-    def parse_listing(self, response, idx, n, streak):
+    async def parse_listing(self, response, idx, n, streak):
         j = self.job
         self.visited.add(response.url)
         entries = self.ad.list_entries(response)
+        # Fase 1 da classificação: corta páginas institucionais/artigos ANTES de gastar pedidos de detalhe.
+        entries, dropped = split_entries(entries)
+        new_drop = [(e, why) for e, why in dropped if e.key not in j.ignored_keys]
+        if new_drop:
+            j.ignored_keys.update(e.key for e, _ in new_drop)
+            j.counts['skipped'] += len(new_drop)
+            for e, why in new_drop[:10]:
+                print(f'[classify] ligação ignorada (não é conteúdo) {e.url}: {why}')
+            if len(new_drop) > 10:
+                print(f'[classify] … e mais {len(new_drop) - 10} ligações ignoradas nesta página')
         page = None
         if j.dry:
             try:
@@ -547,9 +577,11 @@ class CatalogSpider(scrapy.Spider):
             j._page_keys.append([e.key for e in entries])
         if not entries:
             if not self.first_page_seen and j.counts['discovered'] == 0:
-                j.fatal = f'nenhuma entrada encontrada em {response.url} — verifique options.config.link_selector'
+                extra = f' ({len(dropped)} ligações foram classificadas como não-conteúdo)' if dropped else ''
+                j.fatal = f'nenhuma entrada encontrada em {response.url}{extra} — verifique options.config.link_selector'
                 raise CloseSpider('no_entries')
-            yield from self._finish_page({'remaining': 0, 'resume': {'section': idx + 1, 'url': None, 'n': 1, 'rank_t0': j.rank_t0, 'rank_pos': j.rank_pos}, 'stop': None, 'streak': 0})
+            async for r in self._finish_page({'remaining': 0, 'resume': {'section': idx + 1, 'url': None, 'n': 1, 'rank_t0': j.rank_t0, 'rank_pos': j.rank_pos}, 'stop': None, 'streak': 0}):
+                yield r
             return
         self.first_page_seen = True
 
@@ -560,7 +592,8 @@ class CatalogSpider(scrapy.Spider):
         if j.dry or not entries:
             unseen = list(entries)        # sonda: não consulta nem grava o "já capturado?" (/seen/filter escreve no D1)
         else:
-            res = j.worker.filter(j.src['id'], j.job_id, [{'key': e.key, 'url': e.url} for e in entries])
+            # HTTP síncrono (com retries) ao worker: fora do event loop, para não o bloquear.
+            res = await run_in_thread(j.worker.filter, j.src['id'], j.job_id, [{'key': e.key, 'url': e.url} for e in entries])
             unseen_keys = set(res['unseen'])
             unseen = [e for e in entries if e.key in unseen_keys]
         j.counts['discovered'] += len(entries)
@@ -597,10 +630,12 @@ class CatalogSpider(scrapy.Spider):
         if not j.opts.get('extract_details', True):
             for e in todo:
                 self._buffer(e, e.url, self.ad.parse_inline(response, e), idx)
-            yield from self._finish_page(st)
+            async for r in self._finish_page(st):
+                yield r
             return
         if not todo:
-            yield from self._finish_page(st)
+            async for r in self._finish_page(st):
+                yield r
             return
         st['remaining'] = len(todo)
         for e in todo:
@@ -611,7 +646,7 @@ class CatalogSpider(scrapy.Spider):
         self.job.buffer.append({'key': entry.key, 'detail_url': detail_url, 'section_url': self.sections[idx], 'magnets': rec['magnets'],
                                 'md': rec['metadata'], 'rank': entry.rank, 'labels': rec.get('labels') or {}, 'thumb': rec['metadata'].get('thumb') or entry.thumb, 'title': entry.title})
 
-    def parse_detail(self, response, entry, st):
+    async def parse_detail(self, response, entry, st):
         if self.job.dry and 'detail' not in self.job.sample['diagnostics']:
             try:
                 self.job.sample['diagnostics']['detail'] = diagnose_page(response, 'detail')
@@ -619,27 +654,40 @@ class CatalogSpider(scrapy.Spider):
                 print(f'[probe] diagnóstico do detalhe falhou: {e}')
         try:
             rec = self.ad.parse_detail(response, entry)
-            if self.job.dry and not rec['magnets'] and 'detail_sem_magnet' not in self.job.sample['diagnostics']:
+            non_content = None
+            if not rec['magnets']:
+                # Fase 2: sem magnets, só é "não-conteúdo" com evidência positiva (institucional/artigo); caso contrário é falha normal.
                 try:
-                    self.job.sample['diagnostics']['detail_sem_magnet'] = diagnose_page(response, 'detail')
+                    bad, why = page_verdict(response, rec['metadata'])
+                    non_content = why if bad else None
                 except Exception as e:
-                    print(f'[probe] diagnóstico do detalhe sem magnet falhou: {e}')
-            self._buffer(entry, response.url, rec, st['idx'])
+                    print(f'[classify] verdict falhou em {response.url}: {e}')
+            if non_content:
+                self.job.skip_non_content(entry.key, response.url, non_content)
+            else:
+                if self.job.dry and not rec['magnets'] and 'detail_sem_magnet' not in self.job.sample['diagnostics']:
+                    try:
+                        self.job.sample['diagnostics']['detail_sem_magnet'] = diagnose_page(response, 'detail')
+                    except Exception as e:
+                        print(f'[probe] diagnóstico do detalhe sem magnet falhou: {e}')
+                self._buffer(entry, response.url, rec, st['idx'])
         except Exception as e:
             self.job.fail_direct(entry.key, entry.url, f'parse: {e}')
         st['remaining'] -= 1
         if st['remaining'] == 0:
-            yield from self._finish_page(st)
+            async for r in self._finish_page(st):
+                yield r
 
-    def detail_error(self, failure):
+    async def detail_error(self, failure):
         kw = failure.request.cb_kwargs
         self.job.fail_direct(kw['entry'].key, kw['entry'].url, failure.getErrorMessage()[:120])
         kw['st']['remaining'] -= 1
         if kw['st']['remaining'] == 0:
-            yield from self._finish_page(kw['st'])
+            async for r in self._finish_page(kw['st']):
+                yield r
 
     # ── fim de página: flush, checkpoint, limites ───────────────────────
-    def _finish_page(self, st):
+    async def _finish_page(self, st):
         j = self.job
         j.counts['pages'] += 1
         reason = st.get('stop')
@@ -651,9 +699,12 @@ class CatalogSpider(scrapy.Spider):
         j.candidate_cp = resume
         all_done = resume['section'] >= len(self.sections)
         if len(j.buffer) >= BATCH_ITEMS or j.failed_direct and len(j.failed_direct) >= BATCH_ITEMS or reason or all_done:
-            j.flush()
+            # flush = resolve + thumbnails + git push + API (com retries) + commit: pode demorar minutos. Corre numa thread
+            # (o event loop fica livre) e é aguardado AQUI, por isso a próxima listagem só é pedida depois de terminar →
+            # nada mais muta o estado do job durante o flush e a ordem/checkpoint mantêm-se exatamente como antes.
+            await run_in_thread(j.flush)
         elif time.time() - j.last_hb > HEARTBEAT_S:
-            j.heartbeat()
+            await run_in_thread(j.heartbeat)
         if j.fatal:
             raise CloseSpider('fatal')
         if j.cancelled and not reason:
