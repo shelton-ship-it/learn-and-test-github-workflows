@@ -34,6 +34,7 @@ class Entry:
     thumb: str = None
     title: str = None
     magnets: list = field(default_factory=list)
+    rank: int = None          # posição na listagem do site (0 = o mais recente); define a ordem no catálogo
 
 
 def canonical(url):
