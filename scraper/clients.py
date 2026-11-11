@@ -6,12 +6,16 @@ import urllib.error
 import urllib.request
 
 
+# A Cloudflare bloqueia (403, código 1010) o User-Agent por omissão do urllib ("Python-urllib/x"); sem isto o worker recusa o scraper.
+UA = 'Mozilla/5.0 (compatible; HDtorrentCatalog/1.0)'
+
+
 def _call(method, url, key_header, key, payload=None, timeout=60, retries=4, retry_on=(429,)):
     data = json.dumps(payload).encode() if payload is not None else None
     last = None
     for attempt in range(1, retries + 1):
         req = urllib.request.Request(url, data=data, method=method,
-                                     headers={'Content-Type': 'application/json', key_header: key})
+                                     headers={'Content-Type': 'application/json', 'User-Agent': UA, key_header: key})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 body = r.read()
