@@ -271,8 +271,12 @@ class Job:
             except Exception as e:
                 self.api_failures += 1
                 errors = {en['item']['id']: str(e)[:200] for en in entries}
-                print(f'[api] registo falhou ({self.api_failures}/{MAX_API_FAILURES}): {e}')
-                if self.api_failures >= MAX_API_FAILURES:
+                print(f'[api] registo falhou ({self.api_failures}/{MAX_API_FAILURES}): {str(e)[:200]}')
+                code = next((c for c in (401, 403, 404) if f'HTTP {c}' in str(e)), None)
+                if code:      # erro de configuração, não transitório: não adianta insistir
+                    self.fatal = (f'API do catálogo respondeu HTTP {code} em {self.api.base}/api/pipeline/register — '
+                                  'confira o secret PIPELINE_API (sem /api no fim), a chave ADMIN_API_KEY e se a pixel_service_v1 está publicada')
+                elif self.api_failures >= MAX_API_FAILURES:
                     self.fatal = f'API do catálogo indisponível: {str(e)[:200]}'
             for b, r in ready:
                 if r['catalog_id'] in errors:
