@@ -32,6 +32,7 @@ from .clients import ApiClient, WorkerClient
 from .storage import StorageUnavailable, ThumbStore
 
 BATCH_ITEMS = 100
+API_BATCH = 50                           # máx. de entradas por pedido à API (limite da pixel_service_v1)
 DEADLINE_S = 5 * 3600 + 10 * 60          # o workflow tem timeout de 345 min: termina com folga e devolve checkpoint
 HEARTBEAT_S = 60
 MAX_API_FAILURES = 5                     # lotes consecutivos que falham o registo na API (cada um já tenta 5x com espera) antes de abortar
@@ -267,25 +268,35 @@ class Job:
                                    'detail_url': b['detail_url'], 'job_id': self.job_id, 'extracted_at': int(time.time() * 1000)},
                 })
             errors, infra = {}, set()
-            try:
-                out = self.api.register(entries)
-                self.api_failures = 0
-                errors = {e['id']: e.get('error', 'erro') for e in (out.get('errors') or [])}
-            except Exception as e:
-                # Falha de infraestrutura (API/Turso/EdgeOne): NÃO é culpa dos itens. Não os marcamos como falhados no D1
-                # (o worker desiste de um item após 3 falhas) e congelamos o checkpoint para retomar deste ponto.
-                self.api_failures += 1
-                self.api_batches_failed += 1
-                self.cp_frozen = True
-                infra = {en['item']['id'] for en in entries}
-                errors = {i: str(e)[:200] for i in infra}
-                print(f'[api] registo falhou ({self.api_failures}/{MAX_API_FAILURES}): {str(e)[:200]}')
-                code = next((c for c in (401, 403, 404) if f'HTTP {c}' in str(e)), None)
-                if code:      # erro de configuração, não transitório: não adianta insistir
-                    self.fatal = (f'API do catálogo respondeu HTTP {code} em {self.api.base}/api/pipeline/register — '
-                                  'confira o secret PIPELINE_API (sem /api no fim), a chave ADMIN_API_KEY e se a pixel_service_v1 está publicada')
-                elif self.api_failures >= MAX_API_FAILURES:
-                    self.fatal = f'API do catálogo indisponível: {str(e)[:200]}'
+            parts = list(chunks(entries, API_BATCH))           # a API aceita 1 a 50 entradas por pedido
+            for k, part in enumerate(parts):
+                try:
+                    out = self.api.register(part)
+                    self.api_failures = 0
+                    errors.update({e['id']: e.get('error', 'erro') for e in (out.get('errors') or [])})
+                except Exception as e:
+                    # Falha de infraestrutura (API/Turso/EdgeOne): NÃO é culpa dos itens. Não os marcamos como falhados no D1
+                    # (o worker desiste de um item após 3 falhas) e congelamos o checkpoint para retomar deste ponto.
+                    self.api_failures += 1
+                    self.api_batches_failed += 1
+                    self.cp_frozen = True
+                    msg = str(e)[:200]
+                    print(f'[api] registo falhou ({self.api_failures}/{MAX_API_FAILURES}): {msg}')
+                    code = next((c for c in (400, 401, 403, 404, 413) if f'HTTP {c}' in str(e)), None)
+                    if code in (400, 413):     # o pedido é recusado sempre da mesma forma: não adianta insistir
+                        self.fatal = f'API do catálogo recusou o pedido (HTTP {code}): {msg[:160]}'
+                    elif code:                 # configuração
+                        self.fatal = (f'API do catálogo respondeu HTTP {code} em {self.api.base}/api/pipeline/register — '
+                                      'confira o secret PIPELINE_API (sem /api no fim), a chave ADMIN_API_KEY e se a pixel_service_v1 está publicada')
+                    elif self.api_failures >= MAX_API_FAILURES:
+                        self.fatal = f'API do catálogo indisponível: {msg}'
+                    # este bloco e, se o job vai abortar, os que não chegaram a ser enviados: por processar (não "falhados")
+                    pending = part + (sum(parts[k + 1:], []) if self.fatal else [])
+                    ids = {en['item']['id'] for en in pending}
+                    infra |= ids
+                    errors.update({i: msg for i in ids})
+                    if self.fatal:
+                        break
             for b, r in ready:
                 if r['catalog_id'] in errors:
                     self.counts['failures'] += 1
