@@ -14,6 +14,9 @@ def outcome(job, spider):
     if job.fatal:
         return 'failed', job.fatal
     r = spider.stop_reason
+    if job.cp_frozen and not job.dry:
+        return 'failed', (f'{job.api_batches_failed} lote(s) não foram registados na API (instabilidade do EdgeOne/Turso); '
+                          'o job será repetido a partir do último ponto seguro')
     if job.dry:    # sonda: terminar por limites (páginas/itens) é o normal; nunca deixa continuação
         if r == 'cancelled':
             return 'failed', 'job cancelado/expirado no worker'
