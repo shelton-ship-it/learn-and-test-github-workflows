@@ -1,0 +1,226 @@
+"""Adaptador genérico (JSON opcional em options.config).
+
+Com seletores configurados usa-os. SEM seletores (modo automático) reconhece a estrutura típica de sites de
+catálogo: cartões repetidos com ligações de um só segmento (/titulo-2026/), paginação por rel=next, /page/N/ ou
+texto "próxima", e taxonomias/pessoas pelo padrão do URL (/genero/x/, /diretor/y/, /atores/z/).
+
+  link_selector      CSS dos <a> para as páginas de detalhe (opcional: sem ele, modo automático)
+  item_selector      CSS de cada cartão da listagem (opcional; link/thumb/título são relativos a ele)
+  thumb_selector     CSS da imagem do cartão (usa ::attr(src) ou ::attr(data-src))
+  key                {"attr": "data-id"} (no cartão) ou {"regex": "/(\\d+)-"} (no URL de detalhe)
+                     sem 'key' => URL canónico do detalhe
+  next_selector      CSS do link "página seguinte"
+  discover_sections  {"selector": "a.cat", "include_regex": "...", "max": 30} — enumera categorias na página inicial
+  detail             {"title","description","thumb","tags","year","subcategory","terms","directors","cast",
+                      "magnet_selector","fields":{nome:css}}   (terms = géneros/chips; os magnets levam o texto do botão como rótulo)
+  wait_selector      (Playwright) CSS a esperar antes de ler a página
+  obey_robots        true (por omissão)
+  max_magnets_per_item  30
+"""
+import re
+import urllib.parse
+from collections import Counter
+from dataclasses import dataclass, field
+
+from parsel import Selector
+
+from ..extract import extract_metadata, find_magnets, magnet_options
+
+
+@dataclass
+class Entry:
+    key: str
+    url: str
+    thumb: str = None
+    title: str = None
+    magnets: list = field(default_factory=list)
+
+
+def canonical(url):
+    u = urllib.parse.urlsplit(url)
+    q = [(k, v) for k, v in urllib.parse.parse_qsl(u.query, keep_blank_values=True) if not k.lower().startswith('utm_')]
+    return urllib.parse.urlunsplit((u.scheme.lower(), u.netloc.lower(), u.path, urllib.parse.urlencode(q), ''))
+
+
+class GenericAdapter:
+    name = 'generic'
+
+    def __init__(self, cfg):
+        self.cfg = cfg or {}
+        self.auto = not self.cfg.get('link_selector')    # sem seletores: reconhece a estrutura sozinho (ver _auto_*)
+        self.key_cfg = self.cfg.get('key') or {}
+        self.detail_cfg = self.cfg.get('detail') or {}
+        self.max_magnets = int(self.cfg.get('max_magnets_per_item', 30))
+
+    # ── modo automático ───────────────────────────────────────────────────
+    RESERVED = {'genero', 'generos', 'genre', 'genres', 'categoria', 'categorias', 'category', 'tag', 'tags', 'page', 'diretor',
+                'diretores', 'director', 'atores', 'ator', 'elenco', 'actor', 'author', 'autor', 'feed', 'search', 'busca', 'buscar',
+                'sobre', 'about', 'contato', 'contact', 'login', 'register', 'wp-content', 'wp-admin', 'wp-json', 'tag', 'sitemap',
+                'privacidade', 'dmca', 'termos', 'terms', 'privacy'}
+    _NEXT_TEXT = re.compile(r'^\s*(pr[óo]xim[ao]|next|seguinte|mais antigos?|older)\b|[»›>]\s*$', re.I)
+
+    @staticmethod
+    def _host(u):
+        return urllib.parse.urlsplit(u).netloc.lower().removeprefix('www.')
+
+    @staticmethod
+    def _sig(el, depth=3):
+        parts, cur = [], el
+        for _ in range(depth):
+            if cur is None:
+                break
+            parts.append(cur.tag + '.' + '.'.join(sorted((cur.get('class') or '').split())))
+            cur = cur.getparent()
+        return '>'.join(parts)
+
+    def _auto_entries(self, response):
+        sel = Selector(text=response.text)
+        host = self._host(response.url)
+        cands = []
+        for a in sel.root.iter('a'):
+            href = (a.get('href') or '').strip()
+            if not href or href.startswith(('#', 'javascript:', 'mailto:', 'magnet:')):
+                continue
+            url = urllib.parse.urljoin(response.url, href)
+            u = urllib.parse.urlsplit(url)
+            if self._host(url) != host or u.query:
+                continue
+            segs = [x for x in u.path.split('/') if x]
+            if len(segs) != 1 or segs[0].lower() in self.RESERVED or segs[0].lower().startswith('wp-') or len(segs[0]) < 4:
+                continue
+            cands.append((a, canonical(url)))
+        if not cands:
+            return []
+        sigs = Counter(self._sig(a) for a, _ in cands)
+        top = max(sigs.values())
+        keep = {sg for sg, n in sigs.items() if n >= max(4, top // 2)}
+        if not keep:
+            return []
+        by_url = {}
+        for a, url in cands:
+            if self._sig(a) not in keep:
+                continue
+            text = re.sub(r'\s+', ' ', ''.join(a.itertext())).strip()
+            img = a.find('.//img')
+            if img is None and a.getparent() is not None:
+                img = a.getparent().find('.//img')
+            thumb = None
+            if img is not None:
+                thumb = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+                if thumb:
+                    thumb = urllib.parse.urljoin(response.url, thumb)
+            title = (img.get('alt') if img is not None and img.get('alt') else None)
+            cur = by_url.get(url)
+            best_text = text if len(text) >= 4 else None
+            if cur is None:
+                by_url[url] = Entry(key=url, url=url, thumb=thumb, title=(best_text or title or None), magnets=[])
+            else:
+                if best_text and (not cur.title or len(best_text) > len(cur.title)):
+                    cur.title = best_text
+                cur.thumb = cur.thumb or thumb
+        return [e for e in by_url.values()]
+
+    def _auto_next(self, response):
+        sel = Selector(text=response.text)
+        n = sel.css('a[rel~="next"]::attr(href), link[rel="next"]::attr(href)').get()
+        if n:
+            return urllib.parse.urljoin(response.url, n)
+        m = re.search(r'/page/(\d+)/?$', urllib.parse.urlsplit(response.url).path)
+        cur = int(m.group(1)) if m else 1
+        host = self._host(response.url)
+        by_text = None
+        for a in sel.css('a[href]'):
+            url = urllib.parse.urljoin(response.url, a.attrib['href'])
+            if self._host(url) != host:
+                continue
+            pm = re.search(r'/page/(\d+)/?$', urllib.parse.urlsplit(url).path)
+            text = re.sub(r'\s+', ' ', ' '.join(a.css('::text').getall())).strip()
+            if pm and int(pm.group(1)) == cur + 1 and self._NEXT_TEXT.search(text):
+                return url
+            if pm and int(pm.group(1)) == cur + 1 and not by_text:
+                by_text = url
+        return by_text
+
+    # ── listagem ─────────────────────────────────────────────────────────
+    def _key(self, url, node):
+        if self.key_cfg.get('attr') and node is not None:
+            v = node.attrib.get(self.key_cfg['attr'])
+            if v:
+                return str(v)[:200]
+        if self.key_cfg.get('regex'):
+            m = re.search(self.key_cfg['regex'], url)
+            if m:
+                return (m.group(1) if m.groups() else m.group(0))[:200]
+        return canonical(url)
+
+    def list_entries(self, response):
+        if self.auto:
+            return self._auto_entries(response)
+        sel = Selector(text=response.text)
+        entries, seen = [], set()
+        nodes = sel.css(self.cfg['item_selector']) if self.cfg.get('item_selector') else [sel]
+        for node in nodes:
+            link_nodes = node.css(self.cfg['link_selector'])
+            if not link_nodes:
+                continue
+            for a in (link_nodes if not self.cfg.get('item_selector') else link_nodes[:1]):
+                href = a.attrib.get('href')
+                if not href or href.startswith(('javascript:', 'mailto:', '#', 'magnet:')):
+                    continue
+                url = canonical(urllib.parse.urljoin(response.url, href.strip()))
+                key = self._key(url, node if self.cfg.get('item_selector') else a)
+                if key in seen:
+                    continue
+                seen.add(key)
+                thumb = None
+                if self.cfg.get('thumb_selector') and self.cfg.get('item_selector'):
+                    t = node.css(self.cfg['thumb_selector'])
+                    if t:
+                        thumb = t[0].attrib.get('src') or t[0].attrib.get('data-src') or t[0].css('::attr(src)').get()
+                        if thumb:
+                            thumb = urllib.parse.urljoin(response.url, thumb)
+                title = (a.attrib.get('title') or ' '.join(a.css('::text').getall())).strip() or None
+                mags = find_magnets(node.get(), self.max_magnets) if self.cfg.get('item_selector') else []
+                entries.append(Entry(key=key, url=url, thumb=thumb, title=title[:300] if title else None, magnets=mags))
+        return entries
+
+    def next_page(self, response):
+        css = self.cfg.get('next_selector')
+        if not css:
+            return self._auto_next(response) if self.auto else None
+        n = Selector(text=response.text).css(css)
+        href = n[0].attrib.get('href') if n else None
+        return urllib.parse.urljoin(response.url, href) if href and not href.startswith(('javascript:', '#')) else None
+
+    def discover_sections(self, response):
+        d = self.cfg.get('discover_sections')
+        if not d or not d.get('selector'):
+            return []
+        inc = re.compile(d['include_regex']) if d.get('include_regex') else None
+        out = []
+        for a in Selector(text=response.text).css(d['selector']):
+            href = a.attrib.get('href')
+            if not href:
+                continue
+            url = canonical(urllib.parse.urljoin(response.url, href))
+            if inc and not inc.search(url):
+                continue
+            if url not in out:
+                out.append(url)
+            if len(out) >= int(d.get('max', 30)):
+                break
+        return out
+
+    # ── detalhe ──────────────────────────────────────────────────────────
+    def parse_detail(self, response, entry):
+        sel = Selector(text=response.text)
+        opts = magnet_options(sel, self.detail_cfg.get('magnet_selector'), self.max_magnets)
+        md = extract_metadata(response, self.detail_cfg)
+        return {'magnets': [o['magnet'] for o in opts], 'labels': {o['magnet']: o['label'] for o in opts if o['label']}, 'metadata': md}
+
+    def parse_inline(self, response, entry):
+        """Modo extract_details=false: o cartão da listagem é o item (sem visitar o detalhe)."""
+        return {'magnets': list(entry.magnets), 'labels': {}, 'metadata': {'title': entry.title, 'description': None, 'year': None, 'tags': [],
+                                            'subcategory': None, 'thumb': entry.thumb, 'terms': [], 'directors': [], 'cast': [],
+                                            'published_at': None, 'fields': {},
+                                            'provenance': {'title': 'listing'} if entry.title else {}}}

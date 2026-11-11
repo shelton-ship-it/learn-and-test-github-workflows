@@ -1,0 +1,2 @@
+# Só instalado pelo workflow quando options.playwright = true
+scrapy-playwright>=0.0.40
