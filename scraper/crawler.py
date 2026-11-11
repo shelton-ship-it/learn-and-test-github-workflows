@@ -34,7 +34,7 @@ from .storage import StorageUnavailable, ThumbStore
 BATCH_ITEMS = 100
 DEADLINE_S = 5 * 3600 + 10 * 60          # o workflow tem timeout de 345 min: termina com folga e devolve checkpoint
 HEARTBEAT_S = 60
-MAX_API_FAILURES = 3
+MAX_API_FAILURES = 5                     # lotes consecutivos que falham o registo na API (cada um já tenta 5x com espera) antes de abortar
 IMG_EXT = {'JPEG': ('jpg', 'image/jpeg'), 'PNG': ('png', 'image/png'), 'WEBP': ('webp', 'image/webp'), 'GIF': ('gif', 'image/gif')}
 THUMB_DIR = '/tmp/thumbs'
 SAMPLE_MAX_BYTES = 250_000               # o worker aceita até 300 000
@@ -70,6 +70,9 @@ class Job:
         self.candidate_cp = None
         self.committed_cp = self.checkpoint
         self.fatal = None
+        self.job_keys = set()          # entradas já vistas NESTE job (menus/rodapé repetem-se em todas as páginas de listagem)
+        self.cp_frozen = False         # lote falhou na API: o checkpoint deixa de avançar para o retomar daí
+        self.api_batches_failed = 0
         self.api_failures = 0
         self.last_hb = 0
         self.cancelled = False
@@ -263,14 +266,19 @@ class Job:
                     'provenance': {'source_id': sid, 'source_host': self.src['host'], 'category_url': b['section_url'],
                                    'detail_url': b['detail_url'], 'job_id': self.job_id, 'extracted_at': int(time.time() * 1000)},
                 })
-            errors = {}
+            errors, infra = {}, set()
             try:
                 out = self.api.register(entries)
                 self.api_failures = 0
                 errors = {e['id']: e.get('error', 'erro') for e in (out.get('errors') or [])}
             except Exception as e:
+                # Falha de infraestrutura (API/Turso/EdgeOne): NÃO é culpa dos itens. Não os marcamos como falhados no D1
+                # (o worker desiste de um item após 3 falhas) e congelamos o checkpoint para retomar deste ponto.
                 self.api_failures += 1
-                errors = {en['item']['id']: str(e)[:200] for en in entries}
+                self.api_batches_failed += 1
+                self.cp_frozen = True
+                infra = {en['item']['id'] for en in entries}
+                errors = {i: str(e)[:200] for i in infra}
                 print(f'[api] registo falhou ({self.api_failures}/{MAX_API_FAILURES}): {str(e)[:200]}')
                 code = next((c for c in (401, 403, 404) if f'HTTP {c}' in str(e)), None)
                 if code:      # erro de configuração, não transitório: não adianta insistir
@@ -281,7 +289,8 @@ class Job:
             for b, r in ready:
                 if r['catalog_id'] in errors:
                     self.counts['failures'] += 1
-                    commits.append({'content_key': b['key'], 'detail_url': b['detail_url'], 'state': 'failed'})
+                    if r['catalog_id'] not in infra:      # erro do próprio item devolvido pela API: conta como falha dele
+                        commits.append({'content_key': b['key'], 'detail_url': b['detail_url'], 'state': 'failed'})
                     continue
                 th = b.get('thumbnail') or {}
                 commits.append({'content_key': b['key'], 'detail_url': b['detail_url'], 'state': 'processed', 'catalog_id': r['catalog_id'],
@@ -294,7 +303,7 @@ class Job:
 
         for part in chunks(commits, 50):
             self.worker.commit(sid, self.job_id, part)
-        if not self.fatal:
+        if not self.fatal and not self.cp_frozen:
             self.committed_cp = self.candidate_cp if self.candidate_cp is not None else self.committed_cp
         self.heartbeat()
 
@@ -523,7 +532,11 @@ class CatalogSpider(scrapy.Spider):
             return
         self.first_page_seen = True
 
-        if j.dry:
+        fresh = [e for e in entries if e.key not in j.job_keys]
+        j.job_keys.update(e.key for e in fresh)
+        entries = fresh                       # o que já apareceu numa página anterior deste job não é descarregado de novo
+
+        if j.dry or not entries:
             unseen = list(entries)        # sonda: não consulta nem grava o "já capturado?" (/seen/filter escreve no D1)
         else:
             res = j.worker.filter(j.src['id'], j.job_id, [{'key': e.key, 'url': e.url} for e in entries])
