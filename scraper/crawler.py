@@ -71,6 +71,11 @@ class Job:
         self.candidate_cp = None
         self.committed_cp = self.checkpoint
         self.fatal = None
+        cp0 = self.checkpoint or {}
+        # Ordem do catálogo = ordem do site: o 1.º item da listagem (o mais recente) recebe a data mais alta. As datas são
+        # rank_t0 - posição*1s; rank_t0/rank_pos viajam no checkpoint para as continuações manterem a mesma escala.
+        self.rank_t0 = int(cp0.get('rank_t0') or time.time() * 1000)
+        self.rank_pos = int(cp0.get('rank_pos') or 0)
         self.job_keys = set()          # entradas já vistas NESTE job (menus/rodapé repetem-se em todas as páginas de listagem)
         self.cp_frozen = False         # lote falhou na API: o checkpoint deixa de avançar para o retomar daí
         self.api_batches_failed = 0
@@ -215,6 +220,11 @@ class Job:
             })
         self.heartbeat()
 
+    def _created_at(self, b):
+        """Data de entrada no catálogo derivada da posição na listagem (None = a API usa a hora actual)."""
+        rank = b.get('rank')
+        return None if rank is None else int(self.rank_t0 - rank * 1000)
+
     def flush(self):
         if self.dry:
             return self._flush_probe()
@@ -254,7 +264,7 @@ class Job:
             for b, r in ready:
                 md = b['md']
                 entries.append({
-                    'item': {'id': r['catalog_id'], 'title': b['final_title'], 'type': self.src['type'], 'category': self.src['category'],
+                    'item': {'id': r['catalog_id'], 'title': b['final_title'], 'created_at': self._created_at(b), 'type': self.src['type'], 'category': self.src['category'],
                              'subcategory': md.get('subcategory'), 'description': (md.get('description') or '')[:4000] or None,
                              'tags': md.get('tags') or [], 'year': md.get('year'), 'terms': md.get('terms') or [],
                              'people': {'directors': md.get('directors') or [], 'cast': md.get('cast') or []},
@@ -539,7 +549,7 @@ class CatalogSpider(scrapy.Spider):
             if not self.first_page_seen and j.counts['discovered'] == 0:
                 j.fatal = f'nenhuma entrada encontrada em {response.url} — verifique options.config.link_selector'
                 raise CloseSpider('no_entries')
-            yield from self._finish_page({'remaining': 0, 'resume': {'section': idx + 1, 'url': None, 'n': 1}, 'stop': None, 'streak': 0})
+            yield from self._finish_page({'remaining': 0, 'resume': {'section': idx + 1, 'url': None, 'n': 1, 'rank_t0': j.rank_t0, 'rank_pos': j.rank_pos}, 'stop': None, 'streak': 0})
             return
         self.first_page_seen = True
 
@@ -558,6 +568,9 @@ class CatalogSpider(scrapy.Spider):
 
         room = j.opts['max_items'] - self.items_taken
         todo = unseen[:max(room, 0)]
+        for e in todo:
+            e.rank = j.rank_pos
+            j.rank_pos += 1
         self.items_taken += len(todo)
         stop = 'max_items' if len(unseen) > len(todo) or self.items_taken >= j.opts['max_items'] else None
 
@@ -573,6 +586,7 @@ class CatalogSpider(scrapy.Spider):
         if resume is None:
             section_done = True
             resume = {'section': idx + 1, 'url': None, 'n': 1}
+        resume['rank_t0'], resume['rank_pos'] = j.rank_t0, j.rank_pos
         if not stop and j.counts['pages'] + 1 >= j.opts['max_pages']:
             stop = 'max_pages'
 
@@ -595,7 +609,7 @@ class CatalogSpider(scrapy.Spider):
     # ── detalhe ──────────────────────────────────────────────────────────
     def _buffer(self, entry, detail_url, rec, idx):
         self.job.buffer.append({'key': entry.key, 'detail_url': detail_url, 'section_url': self.sections[idx], 'magnets': rec['magnets'],
-                                'md': rec['metadata'], 'labels': rec.get('labels') or {}, 'thumb': rec['metadata'].get('thumb') or entry.thumb, 'title': entry.title})
+                                'md': rec['metadata'], 'rank': entry.rank, 'labels': rec.get('labels') or {}, 'thumb': rec['metadata'].get('thumb') or entry.thumb, 'title': entry.title})
 
     def parse_detail(self, response, entry, st):
         if self.job.dry and 'detail' not in self.job.sample['diagnostics']:
