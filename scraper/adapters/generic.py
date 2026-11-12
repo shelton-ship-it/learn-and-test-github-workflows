@@ -15,7 +15,7 @@ texto "próxima", e taxonomias/pessoas pelo padrão do URL (/genero/x/, /diretor
                       "magnet_selector","fields":{nome:css}}   (terms = géneros/chips; os magnets levam o texto do botão como rótulo)
   wait_selector      (Playwright) CSS a esperar antes de ler a página
   obey_robots        true (por omissão)
-  max_magnets_per_item  30
+  max_magnets_per_item  50
 """
 import re
 import urllib.parse
@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 
 from parsel import Selector
 
-from ..extract import extract_metadata, find_magnets, magnet_options
+from ..extract import extract_metadata, find_magnets, locate_title, magnet_options, resolve_year
 
 
 @dataclass
@@ -34,7 +34,8 @@ class Entry:
     thumb: str = None
     title: str = None
     magnets: list = field(default_factory=list)
-    rank: int = None          # posição na listagem do site (0 = o mais recente); define a ordem no catálogo
+    rank: int = None          # posição na listagem do site (0 = o mais recente); só desempata quando o site não dá data de publicação
+    year: int = None          # selo de ano do cartão da listagem (quando o site o mostra)
 
 
 def canonical(url):
@@ -51,7 +52,7 @@ class GenericAdapter:
         self.auto = not self.cfg.get('link_selector')    # sem seletores: reconhece a estrutura sozinho (ver _auto_*)
         self.key_cfg = self.cfg.get('key') or {}
         self.detail_cfg = self.cfg.get('detail') or {}
-        self.max_magnets = int(self.cfg.get('max_magnets_per_item', 30))
+        self.max_magnets = int(self.cfg.get('max_magnets_per_item', 50))
 
     # ── modo automático ───────────────────────────────────────────────────
     RESERVED = {'genero', 'generos', 'genre', 'genres', 'categoria', 'categorias', 'category', 'tag', 'tags', 'page', 'diretor',
@@ -73,6 +74,30 @@ class GenericAdapter:
             parts.append(cur.tag + '.' + '.'.join(sorted((cur.get('class') or '').split())))
             cur = cur.getparent()
         return '>'.join(parts)
+
+    _YEAR_BADGE = re.compile(r'^(19[2-9]\d|20[0-4]\d)$')
+
+    @staticmethod
+    def _card_scope(a, url, base):
+        """O cartão = o ancestral mais largo (até 3 níveis) cujas ligações apontam todas para o mesmo detalhe."""
+        scope, cur = a, a
+        for _ in range(3):
+            cur = cur.getparent()
+            if cur is None:
+                break
+            urls = {canonical(urllib.parse.urljoin(base, (x.get('href') or '').strip())) for x in cur.iter('a') if (x.get('href') or '').strip()}
+            if urls - {url}:
+                break
+            scope = cur
+        return scope
+
+    def _badge_year(self, scope):
+        for leaf in scope.iter():
+            if isinstance(leaf.tag, str) and len(leaf) == 0:
+                t = (leaf.text or '').strip()
+                if self._YEAR_BADGE.match(t):
+                    return int(t)
+        return None
 
     def _auto_entries(self, response):
         sel = Selector(text=response.text)
@@ -101,10 +126,14 @@ class GenericAdapter:
         for a, url in cands:
             if self._sig(a) not in keep:
                 continue
-            text = re.sub(r'\s+', ' ', ''.join(a.itertext())).strip()
+            text = re.sub(r'\s+', ' ', ' '.join(a.itertext())).strip()
+            scope = self._card_scope(a, url, response.url)
+            badge = self._badge_year(scope)
+            if badge and text.startswith(str(badge)) and len(text) > 4:
+                text = text[4:].strip()                 # o selo de ano vem colado ao texto do cartão
             img = a.find('.//img')
-            if img is None and a.getparent() is not None:
-                img = a.getparent().find('.//img')
+            if img is None:
+                img = scope.find('.//img')
             thumb = None
             if img is not None:
                 thumb = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
@@ -114,8 +143,9 @@ class GenericAdapter:
             cur = by_url.get(url)
             best_text = text if len(text) >= 4 else None
             if cur is None:
-                by_url[url] = Entry(key=url, url=url, thumb=thumb, title=(best_text or title or None), magnets=[])
+                by_url[url] = Entry(key=url, url=url, thumb=thumb, title=(best_text or title or None), magnets=[], year=badge)
             else:
+                cur.year = cur.year or badge
                 if best_text and (not cur.title or len(best_text) > len(cur.title)):
                     cur.title = best_text
                 cur.thumb = cur.thumb or thumb
@@ -215,13 +245,27 @@ class GenericAdapter:
     # ── detalhe ──────────────────────────────────────────────────────────
     def parse_detail(self, response, entry):
         sel = Selector(text=response.text)
-        opts = magnet_options(sel, self.detail_cfg.get('magnet_selector'), self.max_magnets)
+        title_el, _site, _ref = locate_title(sel)
+        opts = magnet_options(sel, self.detail_cfg.get('magnet_selector'), self.max_magnets, title_el)
         md = extract_metadata(response, self.detail_cfg)
-        return {'magnets': [o['magnet'] for o in opts], 'labels': {o['magnet']: o['label'] for o in opts if o['label']}, 'metadata': md}
+        if entry is not None and getattr(entry, 'year', None):          # o selo do cartão entra na votação do ano
+            cands = dict(md['year_candidates'], listing=entry.year)
+            year, src, notes = resolve_year(cands)
+            md['year_candidates'] = cands
+            if year:
+                md['year'], md['provenance']['year'] = year, src
+            md['site']['year_notes'] = notes
+        return {'magnets': [o['magnet'] for o in opts], 'labels': {o['magnet']: o['label'] for o in opts if o['label']},
+                'groups': {o['magnet']: o['group'] for o in opts}, 'metadata': md}
 
     def parse_inline(self, response, entry):
         """Modo extract_details=false: o cartão da listagem é o item (sem visitar o detalhe)."""
-        return {'magnets': list(entry.magnets), 'labels': {}, 'metadata': {'title': entry.title, 'description': None, 'year': None, 'tags': [],
-                                            'subcategory': None, 'thumb': entry.thumb, 'terms': [], 'directors': [], 'cast': [],
-                                            'published_at': None, 'fields': {},
-                                            'provenance': {'title': 'listing'} if entry.title else {}}}
+        prov = {}
+        if entry.title:
+            prov['title'] = 'listing'
+        if entry.year:
+            prov['year'] = 'listing'
+        return {'magnets': list(entry.magnets), 'labels': {}, 'groups': {}, 'metadata': {
+            'title': entry.title, 'description': None, 'year': entry.year, 'tags': [], 'subcategory': None, 'thumb': entry.thumb,
+            'terms': [], 'directors': [], 'cast': [], 'published_at': None, 'fields': {}, 'provenance': prov,
+            'site': {}, 'year_candidates': {'listing': entry.year} if entry.year else {}}}
