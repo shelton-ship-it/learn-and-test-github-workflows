@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 
 from parsel import Selector
 
-from ..extract import extract_metadata, find_magnets, locate_title, magnet_options, resolve_year
+from ..extract import _in_chrome, extract_metadata, find_magnets, is_bad_title, locate_title, magnet_options, resolve_year
 
 
 @dataclass
@@ -36,6 +36,9 @@ class Entry:
     magnets: list = field(default_factory=list)
     rank: int = None          # posição na listagem do site (0 = o mais recente); só desempata quando o site não dá data de publicação
     year: int = None          # selo de ano do cartão da listagem (quando o site o mostra)
+
+
+GENRE_LIKE = {'genero', 'generos', 'categoria', 'categorias', 'category', 'tag', 'atores', 'ator', 'diretor', 'diretores', 'page', 'busca', 'search'}
 
 
 def canonical(url):
@@ -131,6 +134,8 @@ class GenericAdapter:
             badge = self._badge_year(scope)
             if badge and text.startswith(str(badge)) and len(text) > 4:
                 text = text[4:].strip()                 # o selo de ano vem colado ao texto do cartão
+            if is_bad_title(text, urllib.parse.urlsplit(response.url).netloc):
+                text = ''                               # "Baixar torrent", nome do site… nunca são o título do item
             img = a.find('.//img')
             if img is None:
                 img = scope.find('.//img')
@@ -183,6 +188,43 @@ class GenericAdapter:
             if m:
                 return (m.group(1) if m.groups() else m.group(0))[:200]
         return canonical(url)
+
+    _CAR_STRONG = re.compile(r'carousel|slider|slick|swiper|owl-|flickity|splide|glide', re.I)
+    _CAR_WEAK = re.compile(r'hero|banner|destaque|featured', re.I)
+    _CLONED = re.compile(r'clone|duplicate', re.I)
+
+    def featured_entries(self, response):
+        """Carrossel de destaque da página: [{position, url, thumb}] pela ordem em que o site o mostra (sem clones do slider).
+        Heurística: ligações com miniatura dentro de um contentor de carrossel/slider (ou, sem esse, banner/destaque) com 3 a 15 itens."""
+        sel = Selector(text=response.text)
+        base = urllib.parse.urlsplit(response.url).netloc.lower().removeprefix('www.')
+        cls = lambda x: f"{x.get('class') or ''} {x.get('id') or ''}"
+        strong, weak = {}, {}
+        for a in sel.root.iter('a'):
+            href = (a.get('href') or '').strip()
+            if not href or href.startswith(('#', 'javascript:', 'mailto:', 'magnet:')) or a.find('.//img') is None:
+                continue
+            u = urllib.parse.urlsplit(urllib.parse.urljoin(response.url, href))
+            if u.netloc.lower().removeprefix('www.') != base or not u.path.strip('/') or u.path.strip('/').split('/')[0].lower() in GENRE_LIKE:
+                continue
+            anc = list(a.iterancestors())[:10]
+            if any(self._CLONED.search(cls(x)) for x in [a] + anc[:6]) or _in_chrome(a):
+                continue
+            url = canonical(urllib.parse.urljoin(response.url, href))
+            img = a.find('.//img')
+            thumb = img.get('data-src') or img.get('data-lazy-src') or img.get('src')
+            for rx, bucket in ((self._CAR_STRONG, strong), (self._CAR_WEAK, weak)):
+                matched = [x for x in anc if rx.search(cls(x))]
+                box = matched[-1] if matched else None        # o contentor mais alto: cada slide também tem classe "slide"
+                if box is not None:
+                    bucket.setdefault(id(box), {})[url] = urllib.parse.urljoin(response.url, thumb) if thumb else None
+                    break
+        for bucket in (strong, weak):
+            groups = [g for g in bucket.values() if 3 <= len(g) <= 15]
+            if groups:
+                best = max(groups, key=len)
+                return [{'position': i, 'url': u, 'thumb': t} for i, (u, t) in enumerate(best.items())]
+        return []
 
     def list_entries(self, response):
         if self.auto:
@@ -245,7 +287,7 @@ class GenericAdapter:
     # ── detalhe ──────────────────────────────────────────────────────────
     def parse_detail(self, response, entry):
         sel = Selector(text=response.text)
-        title_el, _site, _ref = locate_title(sel)
+        title_el, _site, _ref = locate_title(sel, response.url)
         opts = magnet_options(sel, self.detail_cfg.get('magnet_selector'), self.max_magnets, title_el)
         md = extract_metadata(response, self.detail_cfg)
         if entry is not None and getattr(entry, 'year', None):          # o selo do cartão entra na votação do ano

@@ -92,42 +92,96 @@ def _in_chrome(el):
     return False
 
 
+# Textos que NUNCA são o título de um item: chamadas à acção/SEO do site ("Baixar SITE via torrent", "Baixar torrent", "Download"),
+# menus ("Início", "Buscar") e o próprio nome/domínio do site.
+_GENERIC_TITLE = re.compile(r'^\W*(baixar|download|assistir|torrent|buscar|in[ií]cio|home|menu|filmes|s[eé]ries)\W*$|^\W*(baixar|download)\b|\bvia\s+torrent\b|'
+                            r'\b(torrent|download)\s+(gr[aá]tis|dublado|dual)\b|[a-z0-9-]+\.(?:net|com|org|io|tv|me|info|xyz|site|cc|top|to|app)\b', re.I)
+
+
+def is_bad_title(text, host=None):
+    t = re.sub(r'\s+', ' ', str(text or '')).strip()
+    if len(t) < 2 or _GENERIC_TITLE.search(t):
+        return True
+    if host:
+        label = host.lower().removeprefix('www.').split('.')[0]
+        if len(label) >= 5 and label in re.sub(r'[^a-z0-9]', '', t.lower()):
+            return True
+    return False
+
+
+def slug_tokens(url):
+    seg = [x for x in urllib.parse.urlsplit(url or '').path.split('/') if x]
+    return {t for t in _norm_tokens(seg[-1].replace('-', ' ')) if len(t) >= 2 and not t.isdigit()} if seg else set()
+
+
+def title_from_slug(url):
+    """Último recurso: o URL dos itens espelha o título. Nunca inventa — só humaniza o que o site pôs no URL."""
+    seg = [x for x in urllib.parse.urlsplit(url or '').path.split('/') if x]
+    if not seg:
+        return None
+    words = [w for w in seg[-1].split('-') if w]
+    year = words[-1] if words and re.fullmatch(r'(19[2-9]\d|20[0-4]\d)', words[-1]) else None
+    body = ' '.join(words[:-1] if year else words).strip()
+    if len(body) < 2:
+        return None
+    t = body[:1].upper() + body[1:]
+    return f'{t} ({year})' if year else t
+
+
+def pick_title(cands, url, host=None):
+    """cands = [(origem, texto)] por ordem de confiança. Rejeita textos genéricos/SEO/nome do site; entre os restantes prefere o
+    que bate com o URL do item (o slug mirrors o título); sem nenhum válido, humaniza o slug. -> (título, origem, nota)"""
+    ok = [(o, c) for o, c in cands if c and not is_bad_title(c, host)]
+    sl = slug_tokens(url)
+    if ok and len(sl) >= 2:
+        for o, c in ok:
+            tk = _norm_tokens(c)
+            if tk and len(tk & sl) / len(sl) >= 0.6:
+                return c, o, None
+        o, c = ok[0]
+        return c, o, 'título não bate com o URL do item'
+    if ok:
+        return ok[0][1], ok[0][0], None
+    t = title_from_slug(url)
+    return (t, 'url-slug', 'nenhum título válido na página: derivado do URL') if t else (None, None, 'sem título válido')
+
+
 def _norm_tokens(s):
     t = unicodedata.normalize('NFKD', s or '').encode('ascii', 'ignore').decode().lower()
     return set(re.findall(r'[a-z0-9]+', t))
 
 
-def find_title_el(sel, ref_title=None):
+def find_title_el(sel, ref_title=None, host=None, url=None):
     """O <h1>/<h2> que contém o título do item (o que mais se parece com og:title/<title>). Evita apanhar o logótipo/hero
     de outros blocos. None se não houver candidato fiável."""
     root = sel.root
     cands = [el for el in root.iter('h1', 'h2') if isinstance(el.tag, str) and not _in_chrome(el)]
     cands = [(el, _el_text(el)) for el in cands]
-    cands = [(el, t) for el, t in cands if len(t) >= 2]
+    cands = [(el, t) for el, t in cands if len(t) >= 2 and not is_bad_title(clean_title(t), host)]
     if not cands:
         return None
-    ref = _norm_tokens(ref_title)
-    if ref:
-        best, best_score = None, 0.0
-        for el, t in cands:
-            tk = _norm_tokens(t)
-            if not tk:
-                continue
-            score = len(tk & ref) / max(1, len(tk))
-            if score > best_score:
-                best, best_score = el, score
-        if best is not None and best_score >= 0.6:
-            return best
-    h1 = [el for el, _ in cands if el.tag == 'h1']
-    return h1[0] if h1 else None
+    ref = _norm_tokens(ref_title) if ref_title and not is_bad_title(ref_title, host) else set()
+    sl = slug_tokens(url)                      # o URL do item espelha o título: segunda referência quando og:title/<title> são genéricos
+    best, best_score = None, 0.0
+    for el, t in cands:
+        tk = _norm_tokens(clean_title(t))
+        if not tk:
+            continue
+        score = max(len(tk & ref) / max(1, len(tk)) if ref else 0.0, len(tk & sl) / len(sl) if len(sl) >= 2 else 0.0)
+        if score > best_score:
+            best, best_score = el, score
+    if best is not None and best_score >= 0.6:
+        return best
+    return None            # sem correspondência fiável: melhor sem elemento-título do que um h1 genérico do cabeçalho
 
 
-def locate_title(sel):
+def locate_title(sel, url=None):
     """-> (elemento do título, nome do site, título de referência) — partilhado por magnet_options e extract_metadata."""
     og = lambda p: (sel.css(f'meta[property="{p}"]::attr(content)').get() or '').strip() or None
     site_name = og('og:site_name')
     ref = clean_title(og('og:title') or (sel.css('title::text').get() or '').strip(), site_name)
-    return find_title_el(sel, ref), site_name, ref
+    host = urllib.parse.urlsplit(url).netloc.lower() if url else None
+    return find_title_el(sel, ref, host, url), site_name, ref
 
 
 def magnet_options(sel, css=None, limit=50, title_el=None):
@@ -382,11 +436,13 @@ def extract_metadata(response, detail_cfg=None):
         md['provenance'][field] = origin
 
     og = lambda p: (sel.css(f'meta[property="{p}"]::attr(content)').get() or '').strip() or None
-    title_el, site_name, _ref = locate_title(sel)
-    raw_h1 = _el_text(title_el) if title_el is not None else (_first_text(sel, 'h1') or None)
+    host = urllib.parse.urlsplit(response.url).netloc.lower()
+    title_el, site_name, _ref = locate_title(sel, response.url)
+    raw_h1 = _el_text(title_el) if title_el is not None else None
+    tcands = []                                   # (origem, texto) por ordem de confiança
 
     # 1) selectores configurados (fonte explícita)
-    put('title', _first_text(sel, cfg.get('title')), 'config')
+    tcands.append(('config', _first_text(sel, cfg.get('title'))))
     put('description', _first_text(sel, cfg.get('description')), 'config')
     put('subcategory', _first_text(sel, cfg.get('subcategory')), 'config')
     put('tags', _all_text(sel, cfg.get('tags')), 'config')
@@ -406,7 +462,7 @@ def extract_metadata(response, detail_cfg=None):
 
     # 2) título: o <h1>/<h2> do item vem antes de JSON-LD/og/<title> (que costumam trazer sufixos do site)
     if raw_h1:
-        put('title', clean_title(raw_h1, site_name), 'h1')
+        tcands.append(('h1', clean_title(raw_h1, site_name)))
 
     # 3) JSON-LD — o ano só vem de objectos Movie/TVSeries; a data de Article/WebPage é a data de PUBLICAÇÃO
     objs = _ld_objects(sel)
@@ -415,7 +471,7 @@ def extract_metadata(response, detail_cfg=None):
     primary = (content_objs or [o for o in objs if o.get('name') or o.get('headline')] or [None])[0]
     if primary is not None:
         o = primary
-        put('title', clean_title(str(o.get('name') or o.get('headline') or '').strip() or None, site_name), 'json-ld')
+        tcands.append(('json-ld', clean_title(str(o.get('name') or o.get('headline') or '').strip() or None, site_name)))
         put('description', str(o.get('description') or '').strip() or None, 'json-ld')
         put('tags', _as_list(o.get('keywords')), 'json-ld')
         put('terms', _as_list(o.get('genre')), 'json-ld')
@@ -439,7 +495,7 @@ def extract_metadata(response, detail_cfg=None):
             break
 
     # 4) Open Graph e data de publicação alternativa
-    put('title', clean_title(og('og:title'), site_name), 'open-graph')
+    tcands.append(('open-graph', clean_title(og('og:title'), site_name)))
     put('description', og('og:description') or (sel.css('meta[name="description"]::attr(content)').get() or '').strip() or None, 'open-graph')
     put('thumb', og('og:image'), 'open-graph')
     put('tags', [t.strip() for t in sel.css('meta[property="article:tag"]::attr(content)').getall() if t.strip()], 'open-graph')
@@ -452,7 +508,10 @@ def extract_metadata(response, detail_cfg=None):
                 md['published_at'], md['provenance']['published_at'] = ms, origin
 
     # 5) <title>
-    put('title', clean_title((sel.css('title::text').get() or '').strip(), site_name), 'html-title')
+    tcands.append(('html-title', clean_title((sel.css('title::text').get() or '').strip(), site_name)))
+    md['title'], tsrc, tnote = pick_title(tcands, response.url, host)
+    if tsrc:
+        md['provenance']['title'] = tsrc
 
     # 6) géneros/realizador/elenco pela estrutura do conteúdo (nunca pelo menu)
     a_terms, a_dirs, a_cast = content_links(sel, response.url, title_el)
@@ -460,7 +519,6 @@ def extract_metadata(response, detail_cfg=None):
     put('directors', a_dirs, 'url-pattern')
     put('cast', a_cast, 'url-pattern')
 
-    md['title'] = clean_title(md['title'], site_name)
     md['description'] = clean_description(md['description'])
     if not md['description']:
         for p_ in sel.css('p'):
@@ -480,7 +538,7 @@ def extract_metadata(response, detail_cfg=None):
     if year:
         md['year'], md['provenance']['year'] = year, ysrc
     md['site'] = {'raw_title': (raw_h1 or '')[:300] or None, 'audio': title_audio(raw_h1), 'chips': list(dict.fromkeys(md['terms']))[:30],
-                  'year_notes': ynotes, 'title_located': title_el is not None}
+                  'year_notes': ynotes, 'title_located': title_el is not None, 'title_note': tnote}
 
     if md['thumb']:
         md['thumb'] = urllib.parse.urljoin(response.url, md['thumb'])

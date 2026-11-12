@@ -76,6 +76,11 @@ class ApiClient:
         if not self.base or not self.key:
             raise RuntimeError('PIPELINE_API / ADMIN_API_KEY não configurados')
 
+    def register_featured(self, source_id, items):
+        """Ordem do carrossel de destaque do site de origem (a API substitui a anterior desta fonte)."""
+        return _call('POST', f'{self.base}/api/pipeline/featured', 'X-API-Key', self.key, {'source_id': source_id, 'items': items},
+                     timeout=60, retries=3)
+
     def register(self, entries):
         return _call('POST', f'{self.base}/api/pipeline/register', 'X-API-Key', self.key, {'entries': entries},
                      timeout=90, retries=5)

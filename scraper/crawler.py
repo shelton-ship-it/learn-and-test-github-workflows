@@ -36,6 +36,7 @@ except ImportError:                                   # requirements.txt aceita 
 
 from . import netsafe
 from .adapters import get_adapter
+from .adapters.generic import canonical
 from .classify import page_verdict, split_entries
 from .clients import ApiClient, WorkerClient
 from .storage import StorageUnavailable, ThumbStore
@@ -58,6 +59,27 @@ def chunks(seq, n):
         yield seq[i:i + n]
 
 
+_ARCHIVE_PATH = re.compile(r'^/(genero|generos|categoria|categorias|category|tag|atores|ator|diretor|diretores|page|busca|buscar|search|feed)(/|$)', re.I)
+
+
+def landing_problem(landing_url, source_url, sections):
+    """Depois dos redirecionamentos, a página tem de ser UM ITEM do mesmo site. Carrosséis/banners costumam ter só a miniatura e uma
+    ligação que redireciona para a página inicial, uma listagem ou outro domínio — nesses casos não há metadados do item para guardar."""
+    u, s = urllib.parse.urlsplit(landing_url), urllib.parse.urlsplit(source_url)
+    host = lambda x: x.netloc.lower().removeprefix('www.')
+    if host(u) != host(s):
+        return f'redireciona para outro domínio ({host(u)})'
+    path = u.path.rstrip('/')
+    if not path:
+        return 'redireciona para a página inicial (não é um item)'
+    if _ARCHIVE_PATH.match(u.path) or re.search(r'(^|&)s=', u.query):
+        return 'redireciona para uma listagem/arquivo (não é um item)'
+    for sec in sections or []:
+        if urllib.parse.urlsplit(sec).path.rstrip('/') == path:
+            return 'redireciona para uma secção do site (listagem, não é um item)'
+    return None
+
+
 class Job:
     def __init__(self, params, job_id):
         self.job_id = job_id
@@ -67,6 +89,9 @@ class Job:
         self.src = params['source']
         self.cfg = self.opts.get('config') or {}
         self.checkpoint = params.get('checkpoint') or None
+        self.featured = []                   # carrossel de destaque do site de origem: [{position, url, problem?}]
+        self.featured_requested = False
+        self.landed = set()                  # páginas finais (após redirects) já capturadas neste job: carrossel e cartão podem apontar para o mesmo item
         self.started = time.time()
         self.deadline = self.started + DEADLINE_S
         self.worker = WorkerClient(params.get('worker_url'), os.environ.get('ADMIN_API_KEY', ''))
@@ -176,6 +201,8 @@ class Job:
         print(f'[item] ignorado (não é conteúdo) {detail_url}: {reason}')
         self.counts['skipped'] += 1
         if self.dry:
+            if len(self.sample['failures']) < SAMPLE_MAX_FAILURES:
+                self.sample['failures'].append({'detail_url': detail_url, 'reason': f'ignorado: {reason}'[:200]})
             return
         # O worker só conhece processed|failed: registar como 'failed' fecha a página (limite de tentativas) sem a contar em failures.
         self.failed_direct.append({'content_key': entry_key, 'detail_url': detail_url, 'state': 'failed'})
@@ -189,13 +216,24 @@ class Job:
             return
         self.failed_direct.append({'content_key': entry_key, 'detail_url': detail_url, 'state': 'failed'})
 
+    def send_featured(self):
+        """Envia a ordem do carrossel de origem (só destinos válidos: itens do mesmo site). A API casa-os com os itens já registados."""
+        good = sorted((f for f in self.featured if not f.get('problem')), key=lambda f: f['position'])
+        if self.dry or not good:
+            return
+        try:
+            self.api.register_featured(self.src['id'], [{'position': i, 'url': f['url']} for i, f in enumerate(good)])
+            print(f'[destaque] {len(good)} item(ns) do carrossel de origem enviados')
+        except Exception as e:                       # o destaque é acessório: nunca faz falhar o job
+            print(f'[destaque] não foi possível enviar: {e}')
+
     def _judge(self, b, mags):
         """Decisão por item, a partir da própria página: tipo (filme/série), categoria e validações. Partilhada pela sonda e pelo registo real."""
         md = b['md']
         labels = [b['labels'].get(m['original']) for m in mags]
         tv = infer_type(md, b['detail_url'], labels, self.src['type'])
         category = category_of(md, self.src['category'])
-        errors, warnings = validate_item(md, tv['type'], labels, len(mags))
+        errors, warnings = validate_item(md, tv['type'], labels, len(mags), host=urllib.parse.urlsplit(b['detail_url']).netloc.lower())
         if tv['conflict']:
             warnings.append('tipo ambíguo (' + '; '.join(tv['evidence']) + f"): usado o configurado na fonte ({tv['type']})")
         elif tv['source'] == 'fonte' and not tv.get('chosen'):
@@ -505,6 +543,12 @@ def finalize_sample(job, spider):
             inv = sum(1 for a, b2 in zip(dated, dated[1:]) if b2 > a)
             if inv * 5 > len(dated) - 1:
                 hints.append(f'A listagem não está ordenada por data de publicação ({inv} inversões em {len(dated) - 1} pares): o catálogo usa a data do próprio site, não a posição.')
+    if 'carousel_detected' in sm and sm.get('carousel_detected') == 0:
+        hints.append('Nenhum carrossel de destaque detectado na 1.ª página (procura contentores slider/carousel/swiper/slick com 3 a 15 ligações com miniatura). O destaque do site de destino cai para os itens mais recentes.')
+    elif sm.get('featured'):
+        bad = [f for f in sm['featured'] if f.get('problem')]
+        if bad:
+            hints.append(f"{len(bad)} ligação(ões) do carrossel não levam a um item (ex.: {bad[0]['problem']}); só as válidas são enviadas.")
     sm['hints'] = hints
 
     while items and len(json.dumps(sm, ensure_ascii=False)) > SAMPLE_MAX_BYTES:
@@ -670,6 +714,17 @@ class CatalogSpider(scrapy.Spider):
         if not stop and j.counts['pages'] + 1 >= j.opts['max_pages']:
             stop = 'max_pages'
 
+        if idx == 0 and n == 1 and not j.featured_requested and hasattr(self.ad, 'featured_entries'):
+            j.featured_requested = True
+            try:
+                feats = self.ad.featured_entries(response)[:12]
+            except Exception as e:
+                feats = []
+                print(f'[destaque] detecção falhou: {e}')
+            if j.dry:
+                j.sample['carousel_detected'] = len(feats)
+            for f in feats:                          # só segue as ligações: o destino real (após redirects) é validado em parse_featured
+                yield self._req(f['url'], self.parse_featured, errback=self.featured_error, dont_filter=True, cb_kwargs={'pos': f['position'], 'listed': f['url']})
         if page is not None:
             page['next'] = resume['url'] if resume['section'] == idx else None
             page['stop'] = stop
@@ -700,16 +755,27 @@ class CatalogSpider(scrapy.Spider):
             except Exception as e:
                 print(f'[probe] diagnóstico do detalhe falhou: {e}')
         try:
-            rec = self.ad.parse_detail(response, entry)
+            why_landing = landing_problem(response.url, self.job.src['url'], self.sections)
+            if not why_landing:
+                lk = canonical(response.url)
+                if lk in self.job.landed:
+                    why_landing = 'duplicado: esta página já foi capturada neste job por outra ligação (ex.: carrossel)'
+                else:
+                    self.job.landed.add(lk)
+            rec = None if why_landing else self.ad.parse_detail(response, entry)
             non_content = None
-            if not rec['magnets']:
+            if why_landing:
+                self.job.skip_non_content(entry.key, response.url, why_landing)
+            elif not rec['magnets']:
                 # Fase 2: sem magnets, só é "não-conteúdo" com evidência positiva (institucional/artigo); caso contrário é falha normal.
                 try:
                     bad, why = page_verdict(response, rec['metadata'])
                     non_content = why if bad else None
                 except Exception as e:
                     print(f'[classify] verdict falhou em {response.url}: {e}')
-            if non_content:
+            if why_landing:
+                pass
+            elif non_content:
                 self.job.skip_non_content(entry.key, response.url, non_content)
             else:
                 if self.job.dry and not rec['magnets'] and 'detail_sem_magnet' not in self.job.sample['diagnostics']:
@@ -724,6 +790,22 @@ class CatalogSpider(scrapy.Spider):
         if st['remaining'] == 0:
             async for r in self._finish_page(st):
                 yield r
+
+    def _note_featured(self, pos, listed, landing, problem):
+        j = self.job
+        item = {'position': pos, 'listed': listed, 'url': canonical(landing).rstrip('/') if landing else None}
+        if problem:
+            item['problem'] = problem
+        j.featured.append(item)
+        if j.dry:
+            j.sample.setdefault('featured', []).append(item)
+
+    def parse_featured(self, response, pos, listed):
+        self._note_featured(pos, listed, response.url, landing_problem(response.url, self.job.src['url'], self.sections))
+
+    def featured_error(self, failure):
+        kw = failure.request.cb_kwargs
+        self._note_featured(kw['pos'], kw['listed'], None, f'não abriu: {failure.getErrorMessage()[:100]}')
 
     async def detail_error(self, failure):
         kw = failure.request.cb_kwargs
@@ -765,6 +847,10 @@ class CatalogSpider(scrapy.Spider):
         yield self._listing_request(resume['section'], resume['url'], resume['n'], st.get('streak', 0))
 
     def closed(self, reason):
+        try:
+            self.job.send_featured()
+        except Exception as e:
+            print(f'[closed] destaque falhou: {e}')
         try:
             if self.job.buffer or self.job.failed_direct:
                 self.job.flush()

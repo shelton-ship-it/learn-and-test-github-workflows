@@ -13,6 +13,7 @@ import time
 from collections import Counter
 
 from .classify import _reason, slugify_text, url_slug
+from .extract import is_bad_title
 
 # Só Filmes/Séries/Animes são TIPOS no site; "Documentário", "Animação"… são géneros e não entram aqui.
 CHIP_TYPE = {'filmes': 'movies', 'filme': 'movies', 'movies': 'movies', 'movie': 'movies',
@@ -85,16 +86,20 @@ def category_of(md, src_category):
     return src_category
 
 
-def validate_item(md, typ, labels, n_magnets, now_ms=None):
+def validate_item(md, typ, labels, n_magnets, now_ms=None, host=None):
     """-> (erros, avisos). Pode corrigir md in place (descarta valores inválidos, nunca inventa)."""
     errors, warnings = [], []
     now_ms = now_ms or int(time.time() * 1000)
     title = md.get('title') or ''
+    if is_bad_title(title, host):
+        errors.append(f'título inválido (texto genérico/SEO ou nome do site): "{title[:80]}"')
     why = _reason(slugify_text(title)) if title else None
     if why:
         errors.append(f'título parece página institucional/artigo ({why})')
     if re.search(r'\bTorrent\b.*\bDownload\b', title, re.I):
         warnings.append('título ainda traz frases de SEO do site')
+    if (md.get('site') or {}).get('title_note'):
+        warnings.append(md['site']['title_note'])
 
     y = md.get('year')
     if y is not None and not (MIN_YEAR <= int(y) <= time.gmtime(now_ms / 1000).tm_year + 1):
