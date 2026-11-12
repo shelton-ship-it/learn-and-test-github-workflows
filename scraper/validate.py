@@ -17,7 +17,9 @@ from .classify import _reason, slugify_text, url_slug
 # Só Filmes/Séries/Animes são TIPOS no site; "Documentário", "Animação"… são géneros e não entram aqui.
 CHIP_TYPE = {'filmes': 'movies', 'filme': 'movies', 'movies': 'movies', 'movie': 'movies',
              'series': 'series', 'serie': 'series', 'animes': 'anime', 'anime': 'anime'}
-SPECIFIC_TYPES = {'movies', 'series', 'anime', 'documentaries', 'music', 'games', 'software', 'books', 'comics'}
+# Tipos que o administrador escolhe no worker e que a página não consegue distinguir (o site chama "Séries" a um anime):
+# a escolha prevalece sempre; só 'movies'/'series'/'other' (genéricos) são afinados pelas evidências da página.
+CHOSEN_TYPES = {'anime', 'documentaries', 'music', 'games', 'software', 'books', 'comics'}
 
 _SEASON_SLUG = re.compile(r'(^|-)(\d{1,2}[aeo]?-temporada|temporada(-\d{1,2})?|season(-\d{1,2})?)(-|$)')
 _SEASON_TITLE = re.compile(r'(\d{1,2})\s*[ªaºo°]?\s*temporada|temporada\s*(\d{1,2})|season\s*(\d{1,2})', re.I)
@@ -37,7 +39,9 @@ def season_from_title(title):
 
 
 def infer_type(md, url, labels, src_type):
-    """-> {'type', 'source': 'chips'|'conteudo'|'fonte', 'evidence': [..], 'conflict': bool}"""
+    """-> {'type', 'source': 'chips'|'conteudo'|'fonte', 'evidence': [..], 'conflict': bool, 'chosen': bool}"""
+    if src_type in CHOSEN_TYPES:
+        return {'type': src_type, 'source': 'fonte', 'evidence': [f'tipo "{src_type}" escolhido na fonte (a página só distingue filme/série)'], 'conflict': False, 'chosen': True}
     score, ev = Counter(), []
     for t in md.get('terms') or []:
         ty = CHIP_TYPE.get(slugify_text(str(t)))
@@ -60,13 +64,13 @@ def infer_type(md, url, labels, src_type):
     ranked = score.most_common()
     fallback = src_type if src_type else 'other'
     if not ranked:
-        return {'type': fallback, 'source': 'fonte', 'evidence': ['sem evidência na página'], 'conflict': False}
+        return {'type': fallback, 'source': 'fonte', 'evidence': ['sem evidência na página'], 'conflict': False, 'chosen': False}
     top = ranked[0]
     second = ranked[1][1] if len(ranked) > 1 else 0
     if top[1] - second >= 2:
-        return {'type': top[0], 'source': 'chips' if any(e.startswith('chip:') for e in ev) else 'conteudo', 'evidence': ev, 'conflict': False}
+        return {'type': top[0], 'source': 'chips' if any(e.startswith('chip:') for e in ev) else 'conteudo', 'evidence': ev, 'conflict': False, 'chosen': False}
     # Contradição entre sinais (ex.: chip "Filmes" mas título "Temporada"): usa a configuração da fonte se for um tipo concreto.
-    return {'type': src_type if src_type in ('movies', 'series') else top[0], 'source': 'fonte', 'evidence': ev + ['sinais contraditórios'], 'conflict': True}
+    return {'type': src_type if src_type in ('movies', 'series') else top[0], 'source': 'fonte', 'evidence': ev + ['sinais contraditórios'], 'conflict': True, 'chosen': False}
 
 
 def category_of(md, src_category):
@@ -109,10 +113,10 @@ def validate_item(md, typ, labels, n_magnets, now_ms=None):
     if md.get('published_at') is None:
         warnings.append('sem data de publicação do site: a ordem usa a posição na listagem')
 
-    if typ != 'series' and n_magnets > MAX_MOVIE_MAGNETS:
+    if typ not in ('series', 'anime') and n_magnets > MAX_MOVIE_MAGNETS:
         errors.append(f'{n_magnets} magnets num item que não é série: provável mistura com blocos relacionados')
     labs = [str(l) for l in (labels or []) if l]
-    if typ == 'series' and labs and not any(_LABEL_SERIES.search(l) for l in labs) and not season_from_title(title):
+    if typ in ('series', 'anime') and labs and not any(_LABEL_SERIES.search(l) for l in labs) and not season_from_title(title):
         warnings.append('série sem temporada/episódio nos rótulos nem no título')
     if typ == 'movies' and any(_LABEL_SERIES.search(l) for l in labs):
         warnings.append('filme com rótulos de temporada/episódio')

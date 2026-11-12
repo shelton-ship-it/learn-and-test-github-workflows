@@ -198,9 +198,9 @@ class Job:
         errors, warnings = validate_item(md, tv['type'], labels, len(mags))
         if tv['conflict']:
             warnings.append('tipo ambíguo (' + '; '.join(tv['evidence']) + f"): usado o configurado na fonte ({tv['type']})")
-        elif tv['source'] == 'fonte':
+        elif tv['source'] == 'fonte' and not tv.get('chosen'):
             warnings.append('tipo vindo da configuração da fonte (sem evidência na página)')
-        elif tv['type'] != self.src['type']:
+        elif tv['type'] != self.src['type'] and not tv.get('chosen'):
             warnings.append(f"tipo da página ({tv['type']}) difere do configurado na fonte ({self.src['type']}): prevalece a página")
         return {'type': tv['type'], 'type_source': tv['source'], 'type_evidence': tv['evidence'], 'category': category,
                 'errors': errors, 'warnings': warnings}
