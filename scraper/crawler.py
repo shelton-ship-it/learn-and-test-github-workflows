@@ -39,6 +39,7 @@ from .adapters import get_adapter
 from .classify import page_verdict, split_entries
 from .clients import ApiClient, WorkerClient
 from .storage import StorageUnavailable, ThumbStore
+from .validate import category_of, infer_type, validate_item
 
 BATCH_ITEMS = 100
 API_BATCH = 20                           # entradas por pedido à API (limite da pixel_service_v1: 50). 20 mantém cada pedido bem abaixo dos 30 s da função
@@ -188,6 +189,22 @@ class Job:
             return
         self.failed_direct.append({'content_key': entry_key, 'detail_url': detail_url, 'state': 'failed'})
 
+    def _judge(self, b, mags):
+        """Decisão por item, a partir da própria página: tipo (filme/série), categoria e validações. Partilhada pela sonda e pelo registo real."""
+        md = b['md']
+        labels = [b['labels'].get(m['original']) for m in mags]
+        tv = infer_type(md, b['detail_url'], labels, self.src['type'])
+        category = category_of(md, self.src['category'])
+        errors, warnings = validate_item(md, tv['type'], labels, len(mags))
+        if tv['conflict']:
+            warnings.append('tipo ambíguo (' + '; '.join(tv['evidence']) + f"): usado o configurado na fonte ({tv['type']})")
+        elif tv['source'] == 'fonte':
+            warnings.append('tipo vindo da configuração da fonte (sem evidência na página)')
+        elif tv['type'] != self.src['type']:
+            warnings.append(f"tipo da página ({tv['type']}) difere do configurado na fonte ({self.src['type']}): prevalece a página")
+        return {'type': tv['type'], 'type_source': tv['source'], 'type_evidence': tv['evidence'], 'category': category,
+                'errors': errors, 'warnings': warnings}
+
     def _flush_probe(self):
         """Sonda: normaliza (leitura) e guarda a amostra. Nada é escrito no D1, na API nem no storage."""
         sid = self.src['id']
@@ -204,7 +221,8 @@ class Job:
             prov = md.get('provenance') or {}
             title = md.get('title') or b.get('title') or (mags[0].get('display_name') if mags else None)
             title_src = prov.get('title') or ('listing' if b.get('title') else ('magnet-dn' if title else None))
-            problems = []
+            verdict = self._judge(b, mags) if mags else {'type': self.src['type'], 'type_source': 'fonte', 'type_evidence': [], 'category': self.src['category'], 'errors': [], 'warnings': []}
+            problems = list(verdict['errors'])
             if not mags:
                 problems.append('nenhum magnet válido' + (f" ({len(r.get('invalid_magnets') or [])} inválido(s))" if r.get('invalid_magnets') else ''))
             if not title:
@@ -215,11 +233,12 @@ class Job:
                 problems.append('sem descrição')
             if md.get('year') is None:
                 problems.append('sem ano')
+            problems.extend(verdict['warnings'])
             if mags and not any(b['labels'].get(m['original']) for m in mags):
                 problems.append('magnets sem rótulo (qualidade/áudio não serão inferidos)')
             if len(mags) > 10:
                 problems.append(f'{len(mags)} magnets: possível mistura com blocos relacionados')
-            if not mags or not title:
+            if not mags or not title or verdict['errors']:
                 self.counts['failures'] += 1
             elif r.get('is_new_item'):
                 self.counts['new'] += 1
@@ -227,12 +246,13 @@ class Job:
                 self.counts['duplicates'] += 1
             self.sample['items'].append({
                 'detail_url': b['detail_url'], 'title': (title or '')[:300] or None, 'title_source': title_src,
-                'year': md.get('year'), 'year_source': prov.get('year'),
+                'type': verdict['type'], 'type_source': verdict['type_source'], 'type_evidence': verdict['type_evidence'][:5], 'category': verdict['category'],
+                'year': md.get('year'), 'year_source': prov.get('year'), 'published_source': prov.get('published_at'), 'site': md.get('site') or {},
                 'description': (md.get('description') or '')[:300] or None, 'description_source': prov.get('description'),
                 'thumb': b.get('thumb'), 'subcategory': md.get('subcategory'), 'published_at': md.get('published_at'),
                 'terms': (md.get('terms') or [])[:20], 'directors': (md.get('directors') or [])[:10], 'cast': (md.get('cast') or [])[:20],
                 'tags': (md.get('tags') or [])[:15], 'fields': md.get('fields') or {},
-                'magnets': [{'label': b['labels'].get(m['original']), 'info_hash': m.get('info_hash'), 'display_name': (m.get('display_name') or '')[:200] or None,
+                'magnets': [{'label': b['labels'].get(m['original']), 'group': b['groups'].get(m['original']), 'info_hash': m.get('info_hash'), 'display_name': (m.get('display_name') or '')[:200] or None,
                              'trackers': len(m.get('trackers') or []), 'normalization': m.get('normalization'), 'changes': m.get('changes'),
                              'already_known': bool(m.get('already_known')), 'normalized': (m.get('normalized') or '')[:400]} for m in mags[:8]],
                 'magnets_total': len(mags), 'invalid_magnets': (r.get('invalid_magnets') or [])[:5], 'problems': problems,
@@ -275,6 +295,10 @@ class Job:
             if not b['md'].get('title'):
                 b['md']['provenance']['title'] = 'listing' if b.get('title') else 'magnet-dn'
             b['final_title'] = title[:300]
+            b['verdict'] = self._judge(b, r['magnets'])
+            if b['verdict']['errors']:
+                fail(b, '; '.join(b['verdict']['errors']))
+                continue
             ready.append((b, r))
 
         if ready:
@@ -282,16 +306,18 @@ class Job:
             entries = []
             for b, r in ready:
                 md = b['md']
+                v = b['verdict']
                 entries.append({
-                    'item': {'id': r['catalog_id'], 'title': b['final_title'], 'created_at': self._created_at(b), 'type': self.src['type'], 'category': self.src['category'],
+                    'item': {'id': r['catalog_id'], 'title': b['final_title'], 'created_at': self._created_at(b), 'type': v['type'], 'category': v['category'],
                              'subcategory': md.get('subcategory'), 'description': (md.get('description') or '')[:4000] or None,
                              'tags': md.get('tags') or [], 'year': md.get('year'), 'terms': md.get('terms') or [],
                              'people': {'directors': md.get('directors') or [], 'cast': md.get('cast') or []},
                              'published_at': md.get('published_at'),
-                             'metadata': {'fields': md.get('fields') or {}, 'provenance': md.get('provenance') or {}}},
+                             'metadata': {'fields': md.get('fields') or {}, 'provenance': md.get('provenance') or {}, 'site': md.get('site') or {},
+                                          'validation': {'type_source': v['type_source'], 'type_evidence': v['type_evidence'][:6], 'warnings': v['warnings'][:12]}}},
                     'magnets': [{'original': m['original'], 'normalized': m['normalized'], 'info_hash': m['info_hash'],
                                  'display_name': m.get('display_name'), 'trackers': m.get('trackers') or [],
-                                 'label': b['labels'].get(m['original'])} for m in r['magnets']],
+                                 'label': b['labels'].get(m['original']), 'group': b['groups'].get(m['original'])} for m in r['magnets']],
                     'thumbnail': b.get('thumbnail'),
                     'provenance': {'source_id': sid, 'source_host': self.src['host'], 'category_url': b['section_url'],
                                    'detail_url': b['detail_url'], 'job_id': self.job_id, 'extracted_at': int(time.time() * 1000)},
@@ -458,6 +484,27 @@ def finalize_sample(job, spider):
                 hints.append(f'{c} de {n} itens: {pr} — {_PROBLEM_TIPS[pr]}.')
         if not any(i['terms'] or i['directors'] or i['cast'] for i in items):
             hints.append('Nenhum item com géneros/realizador/elenco. O modo automático só reconhece /genero/x/, /diretor/y/ e /atores/z/: se o site usa outro padrão, defina detail.terms/directors/cast.')
+    # ── fidelidade ao site: tipo, ano e ordem ─────────────────────────────────────────────────────────────────
+    sm['summary'].update({
+        'com_data_publicacao': sum(1 for i in items if i.get('published_at')),
+        'tipos': dict(Counter(i['type'] for i in items)),
+        'tipo_pela_pagina': sum(1 for i in items if i.get('type_source') in ('chips', 'conteudo')),
+        'anos_distintos': len({i['year'] for i in items if i['year'] is not None}),
+        'itens_com_erros': sum(1 for i in items if any(p.startswith(('título parece', 'provável mistura')) or 'num item que não é série' in p for p in i['problems'])),
+    })
+    if n >= 5:
+        years = {i['year'] for i in items if i['year'] is not None}
+        if len(years) == 1 and sm['summary']['com_ano'] == n:
+            hints.append(f'Todos os {n} itens têm o mesmo ano ({next(iter(years))}). Confirme a origem do ano (year_source): deve vir do título/chip/selo, nunca da data de publicação.')
+        if sm['summary']['com_data_publicacao'] == 0:
+            hints.append('Nenhum item trouxe a data de publicação do site (JSON-LD Article/WebPage, article:published_time, <time>): a ordem do catálogo cai para a posição na listagem. Defina detail.fields ou confirme o HTML.')
+        if sm['summary']['tipo_pela_pagina'] * 2 < n:
+            hints.append('Menos de metade dos itens teve o tipo (filme/série) deduzido da página: o resto usa o tipo configurado na fonte. Verifique os chips de tipo e os rótulos de download.')
+        dated = [i['published_at'] for i in items if i.get('published_at')]
+        if len(dated) >= 5:
+            inv = sum(1 for a, b2 in zip(dated, dated[1:]) if b2 > a)
+            if inv * 5 > len(dated) - 1:
+                hints.append(f'A listagem não está ordenada por data de publicação ({inv} inversões em {len(dated) - 1} pares): o catálogo usa a data do próprio site, não a posição.')
     sm['hints'] = hints
 
     while items and len(json.dumps(sm, ensure_ascii=False)) > SAMPLE_MAX_BYTES:
@@ -644,7 +691,7 @@ class CatalogSpider(scrapy.Spider):
     # ── detalhe ──────────────────────────────────────────────────────────
     def _buffer(self, entry, detail_url, rec, idx):
         self.job.buffer.append({'key': entry.key, 'detail_url': detail_url, 'section_url': self.sections[idx], 'magnets': rec['magnets'],
-                                'md': rec['metadata'], 'rank': entry.rank, 'labels': rec.get('labels') or {}, 'thumb': rec['metadata'].get('thumb') or entry.thumb, 'title': entry.title})
+                                'md': rec['metadata'], 'rank': entry.rank, 'labels': rec.get('labels') or {}, 'groups': rec.get('groups') or {}, 'thumb': rec['metadata'].get('thumb') or entry.thumb, 'title': entry.title})
 
     async def parse_detail(self, response, entry, st):
         if self.job.dry and 'detail' not in self.job.sample['diagnostics']:
