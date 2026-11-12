@@ -286,7 +286,8 @@ class Job:
                 'detail_url': b['detail_url'], 'title': (title or '')[:300] or None, 'title_source': title_src,
                 'type': verdict['type'], 'type_source': verdict['type_source'], 'type_evidence': verdict['type_evidence'][:5], 'category': verdict['category'],
                 'year': md.get('year'), 'year_source': prov.get('year'), 'published_source': prov.get('published_at'), 'site': md.get('site') or {},
-                'description': (md.get('description') or '')[:300] or None, 'description_source': prov.get('description'),
+                'description': (md.get('description') or '')[:2000] or None, 'description_length': len(md.get('description') or ''), 'description_source': prov.get('description'),
+                'trailer': (md.get('trailer') or {}).get('url'),
                 'thumb': b.get('thumb'), 'subcategory': md.get('subcategory'), 'published_at': md.get('published_at'),
                 'terms': (md.get('terms') or [])[:20], 'directors': (md.get('directors') or [])[:10], 'cast': (md.get('cast') or [])[:20],
                 'tags': (md.get('tags') or [])[:15], 'fields': md.get('fields') or {},
@@ -347,11 +348,11 @@ class Job:
                 v = b['verdict']
                 entries.append({
                     'item': {'id': r['catalog_id'], 'title': b['final_title'], 'created_at': self._created_at(b), 'type': v['type'], 'category': v['category'],
-                             'subcategory': md.get('subcategory'), 'description': (md.get('description') or '')[:4000] or None,
+                             'subcategory': md.get('subcategory'), 'description': (md.get('description') or '')[:20000] or None,
                              'tags': md.get('tags') or [], 'year': md.get('year'), 'terms': md.get('terms') or [],
                              'people': {'directors': md.get('directors') or [], 'cast': md.get('cast') or []},
                              'published_at': md.get('published_at'),
-                             'metadata': {'fields': md.get('fields') or {}, 'provenance': md.get('provenance') or {}, 'site': md.get('site') or {},
+                             'metadata': {'fields': md.get('fields') or {}, 'provenance': md.get('provenance') or {}, 'site': md.get('site') or {}, 'trailer': md.get('trailer'),
                                           'validation': {'type_source': v['type_source'], 'type_evidence': v['type_evidence'][:6], 'warnings': v['warnings'][:12]}}},
                     'magnets': [{'original': m['original'], 'normalized': m['normalized'], 'info_hash': m['info_hash'],
                                  'display_name': m.get('display_name'), 'trackers': m.get('trackers') or [],
@@ -479,7 +480,9 @@ def finalize_sample(job, spider):
     hashes = Counter(m['info_hash'] for it in items for m in it['magnets'] if m.get('info_hash'))
     sm['summary'] = {
         'itens_extraidos': n, 'com_titulo': sum(1 for i in items if i['title']), 'com_miniatura': sum(1 for i in items if i['thumb']),
-        'com_descricao': sum(1 for i in items if i['description']), 'com_ano': sum(1 for i in items if i['year'] is not None),
+        'com_descricao': sum(1 for i in items if i['description']),
+        'com_trailer': sum(1 for i in items if i.get('trailer')),
+        'descricoes_cortadas': sum(1 for i in items if i['description'] and i['description'].rstrip().endswith(('…', '...', '[…]'))), 'com_ano': sum(1 for i in items if i['year'] is not None),
         'com_generos': sum(1 for i in items if i['terms']), 'com_realizador': sum(1 for i in items if i['directors']),
         'com_elenco': sum(1 for i in items if i['cast']), 'com_magnet': sum(1 for i in items if i['magnets_total']),
         'magnets_total': sum(i['magnets_total'] for i in items),
@@ -549,6 +552,8 @@ def finalize_sample(job, spider):
         bad = [f for f in sm['featured'] if f.get('problem')]
         if bad:
             hints.append(f"{len(bad)} ligação(ões) do carrossel não levam a um item (ex.: {bad[0]['problem']}); só as válidas são enviadas.")
+    if sm['summary'].get('descricoes_cortadas'):
+        hints.append(f"{sm['summary']['descricoes_cortadas']} descrição(ões) terminam em reticências (cortadas pelo site/SEO) e o corpo da página não trouxe o texto inteiro. Defina detail.description com o selector da sinopse.")
     sm['hints'] = hints
 
     while items and len(json.dumps(sm, ensure_ascii=False)) > SAMPLE_MAX_BYTES:

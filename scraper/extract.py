@@ -276,6 +276,68 @@ def clean_description(d):
     return c if len(c) >= 40 else d
 
 
+_YT = re.compile(r'(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:[^"\'\s#]*?[&;])?v=|embed/|shorts/|v/)|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])', re.I)
+_ELLIPSIS_END = re.compile(r'(?:…|\.\.\.|\[…\]|\[\.\.\.\])\s*$')
+
+
+def _zone(sel, title_el):
+    """Elementos da zona do conteúdo, em ordem de documento: depois do título e antes do primeiro bloco "relacionados"."""
+    after = title_el is None
+    for el in sel.root.iter():
+        if not isinstance(el.tag, str):
+            continue
+        if not after:
+            if el is title_el:
+                after = True
+            continue
+        if el.tag not in ('script', 'style') and _heading_kind(el) == 'related':
+            return
+        yield el
+
+
+def find_trailer(sel, title_el=None):
+    """Trailer do YouTube da página do item: {provider, id, url}. Procura em iframes/ligações/atributos data-* e no JSON-LD (trailer/embedUrl),
+    só na zona do conteúdo (os trailers de outros títulos, nos blocos relacionados, não contam)."""
+    def hit(text):
+        m = _YT.search(htmllib.unescape(text or ''))
+        return m.group(1) if m else None
+
+    for o in _ld_objects(sel):
+        for key in ('trailer', 'embedUrl', 'contentUrl'):
+            v = o.get(key)
+            vid = hit(json.dumps(v) if not isinstance(v, str) else v)
+            if vid:
+                return {'provider': 'youtube', 'id': vid, 'url': f'https://www.youtube.com/watch?v={vid}'}
+    for el in _zone(sel, title_el):
+        if el.tag == 'script':
+            vid = hit(el.text) if (el.text and 'youtu' in el.text) else None
+        elif _in_chrome(el):
+            continue
+        else:
+            vid = next((v for v in (hit(a) for a in el.attrib.values() if 'youtu' in a.lower()) if v), None)
+        if vid:
+            return {'provider': 'youtube', 'id': vid, 'url': f'https://www.youtube.com/watch?v={vid}'}
+    return None
+
+
+def body_synopsis(sel, title_el=None, hint=None):
+    """A sinopse COMPLETA no corpo da página. As meta-descrições (og:description, JSON-LD) são cortadas pelos plugins de SEO (~160
+    caracteres, com "…"), por isso o texto do corpo vence: o parágrafo "Título Torrent … Download – sinopse" ou, se a descrição
+    conhecida estiver cortada, o parágrafo que começa igual e é mais comprido."""
+    best = None
+    for el in _zone(sel, title_el):
+        if el.tag not in ('p', 'div', 'span', 'section') or any(isinstance(c.tag, str) and c.tag in ('p', 'div', 'section', 'ul', 'a') for c in el):
+            continue
+        text = _el_text(el)
+        if not (60 <= len(text) <= 20000):
+            continue
+        if _DESC_HEAD.search(text):
+            return clean_description(text)
+        if hint and text.startswith(hint[:40]) and len(text) > len(hint) and (best is None or len(text) > len(best)):
+            best = text
+    return best
+
+
 def content_links(sel, base_url, title_el=None):
     """Géneros/tags, realizadores e elenco pelo PADRÃO DO URL (/genero/x/, /diretor/y/, /atores/z/), SÓ na zona do conteúdo:
     depois do título e antes do primeiro bloco "relacionados"; nunca dentro de menu/cabeçalho/rodapé/barra lateral."""
@@ -427,7 +489,7 @@ def extract_metadata(response, detail_cfg=None):
     sel = Selector(text=response.text)
     md = {'title': None, 'description': None, 'year': None, 'tags': [], 'subcategory': None, 'thumb': None,
           'terms': [], 'directors': [], 'cast': [], 'published_at': None, 'fields': {}, 'provenance': {},
-          'site': {}, 'year_candidates': {}}
+          'site': {}, 'year_candidates': {}, 'trailer': None}
 
     def put(field, value, origin):
         if value in (None, '', []) or md[field] not in (None, '', []):
@@ -444,6 +506,7 @@ def extract_metadata(response, detail_cfg=None):
     # 1) selectores configurados (fonte explícita)
     tcands.append(('config', _first_text(sel, cfg.get('title'))))
     put('description', _first_text(sel, cfg.get('description')), 'config')
+    put('description', body_synopsis(sel, title_el), 'body')
     put('subcategory', _first_text(sel, cfg.get('subcategory')), 'config')
     put('tags', _all_text(sel, cfg.get('tags')), 'config')
     put('terms', _all_text(sel, cfg.get('terms')), 'config')
@@ -520,6 +583,13 @@ def extract_metadata(response, detail_cfg=None):
     put('cast', a_cast, 'url-pattern')
 
     md['description'] = clean_description(md['description'])
+    if md['description'] and _ELLIPSIS_END.search(md['description']):          # descrição cortada pelo SEO: procura o texto inteiro no corpo
+        full = body_synopsis(sel, title_el, hint=_ELLIPSIS_END.sub('', md['description']).strip())
+        if full:
+            md['description'], md['provenance']['description'] = full, 'body-full'
+    md['trailer'] = find_trailer(sel, title_el)
+    if md['trailer']:
+        md['provenance']['trailer'] = 'page'
     if not md['description']:
         for p_ in sel.css('p'):
             txt = re.sub(r'\s+', ' ', ' '.join(p_.css('::text').getall())).strip()
